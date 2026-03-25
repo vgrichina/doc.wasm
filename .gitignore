@@ -1,2 +1,5 @@
 doc.wasm
 *.DS_Store
+node_modules/
+test/output-*
+.claude/settings.local.json

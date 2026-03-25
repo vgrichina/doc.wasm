@@ -1055,31 +1055,1231 @@
       (return (local.get $err))
     ))
 
-    ;; TODO: Phase 9: Parse CHP/PAP/SEP
-    ;; TODO: Phase 10: Layout
-    ;; TODO: Phase 11: Build render data
+    ;; Phase 9: Parse CHP (character properties)
+    (call $parse_chp)
 
-    (global.set $page_count (i32.const 1))  ;; placeholder
+    ;; Phase 10: Parse PAP (paragraph properties)
+    (call $parse_pap)
+
+    ;; Phase 11: Layout
+    (call $do_layout)
+
     (global.set $error_code (global.get $ERR_NONE))
     (global.get $ERR_NONE)
   )
 
-  ;; ── Render (stub) ───────────────────────────────────────────
+  ;; ── CHP (Character Properties) Parser ───────────────────────
+
+  ;; CHP run format at CHP_BASE: array of 28-byte records
+  ;; [0..3]  cp_start (i32)
+  ;; [4..7]  cp_end (i32)
+  ;; [8..11] flags: bit0=bold, bit1=italic, bit2=underline, bit3=strike
+  ;; [12..15] font_size (half-points, default 24 = 12pt)
+  ;; [16..19] color (0x00RRGGBB, default 0)
+  ;; [20..23] reserved
+  ;; [24..27] reserved
+  (global $chp_run_count (mut i32) (i32.const 0))
+
+  ;; Get operand size for a sprm opcode
+  ;; Bits 13-15 of opcode encode the type:
+  ;; 0=toggle(1), 1=byte(1), 2=word(2), 3=dword(4), 4=variable, 5=variable, 6=variable, 7=triple(3)
+  (func $sprm_size (param $opcode i32) (result i32)
+    (local $spra i32)
+    (local.set $spra (i32.and (i32.shr_u (local.get $opcode) (i32.const 13)) (i32.const 7)))
+    (if (i32.eqz (local.get $spra)) (then (return (i32.const 1))))           ;; toggle
+    (if (i32.eq (local.get $spra) (i32.const 1)) (then (return (i32.const 1)))) ;; byte
+    (if (i32.eq (local.get $spra) (i32.const 2)) (then (return (i32.const 2)))) ;; word
+    (if (i32.eq (local.get $spra) (i32.const 3)) (then (return (i32.const 4)))) ;; long
+    (if (i32.eq (local.get $spra) (i32.const 7)) (then (return (i32.const 3)))) ;; triple
+    ;; 4,5,6 = variable length, first byte is size
+    (i32.const -1)  ;; signal: read next byte for size
+  )
+
+  ;; Parse a grpprl (array of sprms) and extract character formatting
+  ;; Returns flags in lower 16 bits, font_size in bits 16-31
+  (func $parse_chp_sprms (param $ptr i32) (param $len i32) (param $flags i32) (param $font_size i32) (param $color i32)
+        (result i32 i32 i32)
+    (local $pos i32)
+    (local $end i32)
+    (local $opcode i32)
+    (local $operand_size i32)
+    (local $val i32)
+
+    (local.set $pos (local.get $ptr))
+    (local.set $end (i32.add (local.get $ptr) (local.get $len)))
+
+    (block $done
+      (loop $loop
+        ;; Need at least 2 bytes for opcode
+        (br_if $done (i32.ge_u (i32.add (local.get $pos) (i32.const 2)) (local.get $end)))
+
+        (local.set $opcode (call $read_u16_le (local.get $pos)))
+        (local.set $pos (i32.add (local.get $pos) (i32.const 2)))
+
+        (local.set $operand_size (call $sprm_size (local.get $opcode)))
+
+        ;; Handle variable-length sprms
+        (if (i32.eq (local.get $operand_size) (i32.const -1))
+          (then
+            (local.set $operand_size (call $read_u8 (local.get $pos)))
+            (local.set $pos (i32.add (local.get $pos) (i32.const 1)))
+          )
+        )
+
+        ;; sprmCFBold = 0x0835
+        (if (i32.eq (local.get $opcode) (i32.const 0x0835))
+          (then
+            (if (call $read_u8 (local.get $pos))
+              (then (local.set $flags (i32.or (local.get $flags) (i32.const 1))))
+              (else (local.set $flags (i32.and (local.get $flags) (i32.const 0xFFFFFFFE))))
+            )
+          )
+        )
+
+        ;; sprmCFItalic = 0x0836
+        (if (i32.eq (local.get $opcode) (i32.const 0x0836))
+          (then
+            (if (call $read_u8 (local.get $pos))
+              (then (local.set $flags (i32.or (local.get $flags) (i32.const 2))))
+              (else (local.set $flags (i32.and (local.get $flags) (i32.const 0xFFFFFFFD))))
+            )
+          )
+        )
+
+        ;; sprmCFUl (underline) = 0x0838  (actually 0x2A33 for kul, but 0x0838 is simple)
+        (if (i32.eq (local.get $opcode) (i32.const 0x0838))
+          (then
+            (if (call $read_u8 (local.get $pos))
+              (then (local.set $flags (i32.or (local.get $flags) (i32.const 4))))
+              (else (local.set $flags (i32.and (local.get $flags) (i32.const 0xFFFFFFFB))))
+            )
+          )
+        )
+
+        ;; sprmCFStrike = 0x0837
+        (if (i32.eq (local.get $opcode) (i32.const 0x0837))
+          (then
+            (if (call $read_u8 (local.get $pos))
+              (then (local.set $flags (i32.or (local.get $flags) (i32.const 8))))
+              (else (local.set $flags (i32.and (local.get $flags) (i32.const 0xFFFFFFF7))))
+            )
+          )
+        )
+
+        ;; sprmCHps (font size) = 0x4A43
+        (if (i32.eq (local.get $opcode) (i32.const 0x4A43))
+          (then
+            (local.set $font_size (call $read_u16_le (local.get $pos)))
+          )
+        )
+
+        ;; sprmCIco (color index) = 0x2A42
+        (if (i32.eq (local.get $opcode) (i32.const 0x2A42))
+          (then
+            (local.set $val (call $read_u8 (local.get $pos)))
+            ;; Map ico index to RGB (simplified — standard 16 colors)
+            ;; 0=auto(black), 1=black, 2=blue, 3=cyan, 4=green,
+            ;; 5=magenta, 6=red, 7=yellow, 8=white, 9=dk blue,
+            ;; 10=dk cyan, 11=dk green, 12=dk magenta, 13=dk red,
+            ;; 14=dk yellow, 15=dk gray, 16=lt gray
+            ;; For simplicity, treat 0,1 as black, others we'll map later
+            (if (i32.le_u (local.get $val) (i32.const 1))
+              (then (local.set $color (i32.const 0x000000)))
+            )
+            (if (i32.eq (local.get $val) (i32.const 2))
+              (then (local.set $color (i32.const 0x0000FF)))
+            )
+            (if (i32.eq (local.get $val) (i32.const 3))
+              (then (local.set $color (i32.const 0x00FFFF)))
+            )
+            (if (i32.eq (local.get $val) (i32.const 4))
+              (then (local.set $color (i32.const 0x00FF00)))
+            )
+            (if (i32.eq (local.get $val) (i32.const 5))
+              (then (local.set $color (i32.const 0xFF00FF)))
+            )
+            (if (i32.eq (local.get $val) (i32.const 6))
+              (then (local.set $color (i32.const 0xFF0000)))
+            )
+            (if (i32.eq (local.get $val) (i32.const 7))
+              (then (local.set $color (i32.const 0xFFFF00)))
+            )
+            (if (i32.eq (local.get $val) (i32.const 8))
+              (then (local.set $color (i32.const 0xFFFFFF)))
+            )
+          )
+        )
+
+        ;; Advance past operand
+        (local.set $pos (i32.add (local.get $pos) (local.get $operand_size)))
+        (br $loop)
+      )
+    )
+
+    (local.get $flags)
+    (local.get $font_size)
+    (local.get $color)
+  )
+
+  ;; Write a CHP run record at CHP_BASE + index*28
+  (func $write_chp_run (param $idx i32) (param $cp_start i32) (param $cp_end i32)
+                        (param $flags i32) (param $font_size i32) (param $color i32)
+    (local $ptr i32)
+    (local.set $ptr (i32.add (global.get $CHP_BASE) (i32.mul (local.get $idx) (i32.const 28))))
+    (i32.store (local.get $ptr) (local.get $cp_start))
+    (i32.store (i32.add (local.get $ptr) (i32.const 4)) (local.get $cp_end))
+    (i32.store (i32.add (local.get $ptr) (i32.const 8)) (local.get $flags))
+    (i32.store (i32.add (local.get $ptr) (i32.const 12)) (local.get $font_size))
+    (i32.store (i32.add (local.get $ptr) (i32.const 16)) (local.get $color))
+  )
+
+  (func $parse_chp
+    (local $fc_plcfbtechpx i32)
+    (local $lcb i32)
+    (local $n i32)
+    (local $plc_ptr i32)
+    (local $i i32)
+    (local $fc_start i32)
+    (local $fc_end i32)
+    (local $bte_pn i32)
+    (local $fkp_ptr i32)
+    (local $cfkp_crun i32)
+    (local $j i32)
+    (local $rgfc_j i32)
+    (local $rgfc_j1 i32)
+    (local $chpx_offset i32)
+    (local $chpx_ptr i32)
+    (local $chpx_size i32)
+    (local $flags i32)
+    (local $font_size i32)
+    (local $color i32)
+    (local $cp_start i32)
+    (local $cp_end i32)
+
+    (local.set $fc_plcfbtechpx (i32.load (i32.add (global.get $FIB_BASE) (i32.const 16))))
+    (local.set $lcb (i32.load (i32.add (global.get $FIB_BASE) (i32.const 20))))
+
+    ;; If no CHP data, create one default run for all text
+    (if (i32.eqz (local.get $lcb))
+      (then
+        (call $write_chp_run (i32.const 0) (i32.const 0)
+          (i32.div_u (global.get $text_len) (i32.const 2))
+          (i32.const 0) (i32.const 24) (i32.const 0x000000))
+        (global.set $chp_run_count (i32.const 1))
+        (return)
+      )
+    )
+
+    ;; PlcBteChpx is in the table stream at fc_plcfbtechpx
+    ;; Format: (n+1) FCs (u32) then n BTEs (4 bytes each: pn u32)
+    ;; n = (lcb - 4) / 8
+    (local.set $plc_ptr (i32.add (global.get $table_ptr) (local.get $fc_plcfbtechpx)))
+    (local.set $n (i32.div_u (i32.sub (local.get $lcb) (i32.const 4)) (i32.const 8)))
+
+    (global.set $chp_run_count (i32.const 0))
+
+    ;; For each BTE, read the FKP page
+    (local.set $i (i32.const 0))
+    (block $bte_done
+      (loop $bte_loop
+        (br_if $bte_done (i32.ge_u (local.get $i) (local.get $n)))
+
+        ;; BTE pn (page number in WordDocument stream, each page = 512 bytes)
+        (local.set $bte_pn
+          (call $read_u32_le
+            (i32.add (local.get $plc_ptr)
+              (i32.add
+                (i32.mul (i32.add (local.get $n) (i32.const 1)) (i32.const 4))
+                (i32.mul (local.get $i) (i32.const 4))
+              )
+            )
+          )
+        )
+
+        ;; FKP is at page pn * 512 in the WordDocument stream
+        (local.set $fkp_ptr
+          (i32.add (global.get $worddoc_ptr) (i32.mul (local.get $bte_pn) (i32.const 512)))
+        )
+
+        ;; Last byte of FKP = crun (number of runs)
+        (local.set $cfkp_crun
+          (call $read_u8 (i32.add (local.get $fkp_ptr) (i32.const 511)))
+        )
+
+        ;; FKP layout:
+        ;; [0 .. (crun)*4]        rgfc: (crun+1) FCs (u32)
+        ;; [(crun+1)*4 .. ]       unused space and CHPX data
+        ;; [511-crun .. 510]      rgb: crun byte offsets (offset*2 into FKP for CHPX)
+        ;; [511]                  crun
+
+        (local.set $j (i32.const 0))
+        (block $run_done
+          (loop $run_loop
+            (br_if $run_done (i32.ge_u (local.get $j) (local.get $cfkp_crun)))
+
+            ;; FC boundaries
+            (local.set $rgfc_j
+              (call $read_u32_le
+                (i32.add (local.get $fkp_ptr) (i32.mul (local.get $j) (i32.const 4)))
+              )
+            )
+            (local.set $rgfc_j1
+              (call $read_u32_le
+                (i32.add (local.get $fkp_ptr) (i32.mul (i32.add (local.get $j) (i32.const 1)) (i32.const 4)))
+              )
+            )
+
+            ;; Convert FC to CP using piece table mapping
+            (local.set $cp_start (call $fc_to_cp (local.get $rgfc_j)))
+            (local.set $cp_end (call $fc_to_cp (local.get $rgfc_j1)))
+
+            ;; rgb offset byte at 511 - crun + j (counting from end)
+            ;; Actually: the rgb array starts at offset (crun+1)*4 bytes into the FKP... no
+            ;; The rgb array is at the END of the FKP, before the crun byte:
+            ;; byte at FKP + 511 - crun + j gives the offset
+            ;; Wait — standard layout: rgb[j] is at FKP + (crun+1)*4 + j... no
+            ;; Per MS-DOC: the CHPX offsets are stored as bytes at positions
+            ;; FKP[(crun+1)*4 + j], and each byte * 2 = offset within FKP
+            ;; Actually the layout is simpler in the spec:
+            ;; Position of rgb[j] = fkp_ptr + ((crun+1)*4) + j... no that's wrong too.
+            ;; Let me re-read: ChpxFkp has:
+            ;; rgfc: (crun+1) u32 at start
+            ;; then the CHPX data scattered in the middle
+            ;; rgb: crun bytes at the end (before the last byte which is crun)
+            ;; rgb[j] is at fkp_ptr + 511 - crun + j  (NO)
+            ;; Actually: the bytes at FKP[511-crun..510] are the offsets.
+            ;; So rgb[0] = FKP[511-crun], rgb[1] = FKP[511-crun+1], etc.
+            ;; Each byte * 2 = byte offset within FKP to find the CHPX
+
+            (local.set $chpx_offset
+              (i32.mul
+                (call $read_u8
+                  (i32.add (local.get $fkp_ptr)
+                    (i32.add (i32.sub (i32.const 511) (local.get $cfkp_crun)) (local.get $j))
+                  )
+                )
+                (i32.const 2)
+              )
+            )
+
+            ;; Default formatting
+            (local.set $flags (i32.const 0))
+            (local.set $font_size (i32.const 24)) ;; 12pt
+            (local.set $color (i32.const 0x000000))
+
+            ;; If offset is 0, no CHPX (use defaults)
+            (if (local.get $chpx_offset)
+              (then
+                ;; CHPX at fkp_ptr + chpx_offset
+                ;; First byte = cb (size of grpprl)
+                (local.set $chpx_ptr (i32.add (local.get $fkp_ptr) (local.get $chpx_offset)))
+                (local.set $chpx_size (call $read_u8 (local.get $chpx_ptr)))
+
+                ;; Parse sprms
+                (call $parse_chp_sprms
+                  (i32.add (local.get $chpx_ptr) (i32.const 1))
+                  (local.get $chpx_size)
+                  (local.get $flags)
+                  (local.get $font_size)
+                  (local.get $color)
+                )
+                (local.set $color)
+                (local.set $font_size)
+                (local.set $flags)
+              )
+            )
+
+            ;; Only write if valid CP range
+            (if (i32.and
+                  (i32.ge_s (local.get $cp_start) (i32.const 0))
+                  (i32.gt_s (local.get $cp_end) (local.get $cp_start))
+                )
+              (then
+                (call $write_chp_run
+                  (global.get $chp_run_count)
+                  (local.get $cp_start)
+                  (local.get $cp_end)
+                  (local.get $flags)
+                  (local.get $font_size)
+                  (local.get $color)
+                )
+                (global.set $chp_run_count (i32.add (global.get $chp_run_count) (i32.const 1)))
+              )
+            )
+
+            (local.set $j (i32.add (local.get $j) (i32.const 1)))
+            (br $run_loop)
+          )
+        )
+
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $bte_loop)
+      )
+    )
+
+    ;; If no runs found, create default
+    (if (i32.eqz (global.get $chp_run_count))
+      (then
+        (call $write_chp_run (i32.const 0) (i32.const 0)
+          (i32.div_u (global.get $text_len) (i32.const 2))
+          (i32.const 0) (i32.const 24) (i32.const 0x000000))
+        (global.set $chp_run_count (i32.const 1))
+      )
+    )
+  )
+
+  ;; ── FC to CP conversion ─────────────────────────────────────
+  ;; Map a file character offset (FC) back to a character position (CP)
+  ;; by searching the piece table
+
+  (func $fc_to_cp (param $fc i32) (result i32)
+    (local $i i32)
+    (local $pcd_ptr i32)
+    (local $pcd_fc_raw i32)
+    (local $pcd_fc i32)
+    (local $compressed i32)
+    (local $cp_start i32)
+    (local $cp_end i32)
+    (local $char_count i32)
+    (local $fc_offset i32)
+
+    (local.set $i (i32.const 0))
+    (block $done
+      (loop $loop
+        (br_if $done (i32.ge_u (local.get $i) (global.get $piece_count)))
+
+        (local.set $cp_start
+          (call $read_u32_le
+            (i32.add (global.get $piece_cps_ptr) (i32.mul (local.get $i) (i32.const 4)))
+          )
+        )
+        (local.set $cp_end
+          (call $read_u32_le
+            (i32.add (global.get $piece_cps_ptr) (i32.mul (i32.add (local.get $i) (i32.const 1)) (i32.const 4)))
+          )
+        )
+        (local.set $char_count (i32.sub (local.get $cp_end) (local.get $cp_start)))
+
+        (local.set $pcd_ptr
+          (i32.add (global.get $piece_pcds_ptr) (i32.mul (local.get $i) (i32.const 8)))
+        )
+        (local.set $pcd_fc_raw (call $read_u32_le (i32.add (local.get $pcd_ptr) (i32.const 2))))
+        (local.set $compressed (i32.and (i32.shr_u (local.get $pcd_fc_raw) (i32.const 30)) (i32.const 1)))
+        (local.set $pcd_fc (i32.and (local.get $pcd_fc_raw) (i32.const 0x3FFFFFFF)))
+
+        (if (local.get $compressed)
+          (then
+            ;; Compressed: FC range is [pcd_fc/2, pcd_fc/2 + char_count)
+            ;; The incoming $fc should be in this range
+            (local.set $fc_offset (i32.div_u (local.get $pcd_fc) (i32.const 2)))
+            (if (i32.and
+                  (i32.ge_u (local.get $fc) (local.get $fc_offset))
+                  (i32.lt_u (local.get $fc) (i32.add (local.get $fc_offset) (local.get $char_count)))
+                )
+              (then
+                (return (i32.add (local.get $cp_start) (i32.sub (local.get $fc) (local.get $fc_offset))))
+              )
+            )
+          )
+          (else
+            ;; Uncompressed: FC range is [pcd_fc, pcd_fc + char_count*2)
+            (if (i32.and
+                  (i32.ge_u (local.get $fc) (local.get $pcd_fc))
+                  (i32.lt_u (local.get $fc) (i32.add (local.get $pcd_fc) (i32.mul (local.get $char_count) (i32.const 2))))
+                )
+              (then
+                (return (i32.add (local.get $cp_start)
+                  (i32.div_u (i32.sub (local.get $fc) (local.get $pcd_fc)) (i32.const 2))
+                ))
+              )
+            )
+          )
+        )
+
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $loop)
+      )
+    )
+
+    ;; Not found — return -1
+    (i32.const -1)
+  )
+
+  ;; ── PAP (Paragraph Properties) Parser ───────────────────────
+
+  ;; PAP run format at PAP_BASE: array of 28-byte records
+  ;; [0..3]   cp_start (i32)
+  ;; [4..7]   cp_end (i32)
+  ;; [8..11]  alignment (0=left, 1=center, 2=right, 3=justify)
+  ;; [12..15] space_before (twips)
+  ;; [16..19] space_after (twips)
+  ;; [20..23] first_line_indent (twips, can be negative)
+  ;; [24..27] reserved
+  (global $pap_run_count (mut i32) (i32.const 0))
+
+  (func $write_pap_run (param $idx i32) (param $cp_start i32) (param $cp_end i32)
+                        (param $alignment i32) (param $space_before i32) (param $space_after i32)
+                        (param $first_indent i32)
+    (local $ptr i32)
+    (local.set $ptr (i32.add (global.get $PAP_BASE) (i32.mul (local.get $idx) (i32.const 28))))
+    (i32.store (local.get $ptr) (local.get $cp_start))
+    (i32.store (i32.add (local.get $ptr) (i32.const 4)) (local.get $cp_end))
+    (i32.store (i32.add (local.get $ptr) (i32.const 8)) (local.get $alignment))
+    (i32.store (i32.add (local.get $ptr) (i32.const 12)) (local.get $space_before))
+    (i32.store (i32.add (local.get $ptr) (i32.const 16)) (local.get $space_after))
+    (i32.store (i32.add (local.get $ptr) (i32.const 20)) (local.get $first_indent))
+  )
+
+  ;; Parse PAP sprms, returns (alignment, space_before, space_after, first_indent)
+  (func $parse_pap_sprms (param $ptr i32) (param $len i32)
+        (param $align i32) (param $sb i32) (param $sa i32) (param $fi i32)
+        (result i32 i32 i32 i32)
+    (local $pos i32)
+    (local $end i32)
+    (local $opcode i32)
+    (local $operand_size i32)
+
+    (local.set $pos (local.get $ptr))
+    (local.set $end (i32.add (local.get $ptr) (local.get $len)))
+
+    (block $done
+      (loop $loop
+        (br_if $done (i32.ge_u (i32.add (local.get $pos) (i32.const 2)) (local.get $end)))
+
+        (local.set $opcode (call $read_u16_le (local.get $pos)))
+        (local.set $pos (i32.add (local.get $pos) (i32.const 2)))
+
+        (local.set $operand_size (call $sprm_size (local.get $opcode)))
+        (if (i32.eq (local.get $operand_size) (i32.const -1))
+          (then
+            (local.set $operand_size (call $read_u8 (local.get $pos)))
+            (local.set $pos (i32.add (local.get $pos) (i32.const 1)))
+          )
+        )
+
+        ;; sprmPJc (justification) = 0x2403
+        (if (i32.eq (local.get $opcode) (i32.const 0x2403))
+          (then (local.set $align (call $read_u8 (local.get $pos))))
+        )
+
+        ;; sprmPDyaBefore (space before) = 0xA413
+        (if (i32.eq (local.get $opcode) (i32.const 0xA413))
+          (then (local.set $sb (call $read_u16_le (local.get $pos))))
+        )
+
+        ;; sprmPDyaAfter (space after) = 0xA414
+        (if (i32.eq (local.get $opcode) (i32.const 0xA414))
+          (then (local.set $sa (call $read_u16_le (local.get $pos))))
+        )
+
+        ;; sprmPDxaLeft1 (first line indent) = 0x8460
+        (if (i32.eq (local.get $opcode) (i32.const 0x8460))
+          (then (local.set $fi (i32.extend16_s (call $read_u16_le (local.get $pos)))))
+        )
+
+        (local.set $pos (i32.add (local.get $pos) (local.get $operand_size)))
+        (br $loop)
+      )
+    )
+
+    (local.get $align)
+    (local.get $sb)
+    (local.get $sa)
+    (local.get $fi)
+  )
+
+  (func $parse_pap
+    (local $fc_plcfbtepapx i32)
+    (local $lcb i32)
+    (local $n i32)
+    (local $plc_ptr i32)
+    (local $i i32)
+    (local $bte_pn i32)
+    (local $fkp_ptr i32)
+    (local $cpara i32)
+    (local $j i32)
+    (local $rgfc_j i32)
+    (local $rgfc_j1 i32)
+    (local $papx_off_byte i32)
+    (local $papx_ptr i32)
+    (local $papx_word_count i32)
+    (local $papx_istd i32)
+    (local $grpprl_ptr i32)
+    (local $grpprl_len i32)
+    (local $alignment i32)
+    (local $space_before i32)
+    (local $space_after i32)
+    (local $first_indent i32)
+    (local $cp_start i32)
+    (local $cp_end i32)
+
+    (local.set $fc_plcfbtepapx (i32.load (i32.add (global.get $FIB_BASE) (i32.const 24))))
+    (local.set $lcb (i32.load (i32.add (global.get $FIB_BASE) (i32.const 28))))
+
+    ;; If no PAP data, one default paragraph for all text
+    (if (i32.eqz (local.get $lcb))
+      (then
+        (call $write_pap_run (i32.const 0) (i32.const 0)
+          (i32.div_u (global.get $text_len) (i32.const 2))
+          (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0))
+        (global.set $pap_run_count (i32.const 1))
+        (return)
+      )
+    )
+
+    ;; PlcBtePapx: (n+1) FCs + n BTEs (4 bytes each)
+    (local.set $plc_ptr (i32.add (global.get $table_ptr) (local.get $fc_plcfbtepapx)))
+    (local.set $n (i32.div_u (i32.sub (local.get $lcb) (i32.const 4)) (i32.const 8)))
+
+    (global.set $pap_run_count (i32.const 0))
+
+    (local.set $i (i32.const 0))
+    (block $bte_done
+      (loop $bte_loop
+        (br_if $bte_done (i32.ge_u (local.get $i) (local.get $n)))
+
+        (local.set $bte_pn
+          (call $read_u32_le
+            (i32.add (local.get $plc_ptr)
+              (i32.add
+                (i32.mul (i32.add (local.get $n) (i32.const 1)) (i32.const 4))
+                (i32.mul (local.get $i) (i32.const 4))
+              )
+            )
+          )
+        )
+
+        (local.set $fkp_ptr
+          (i32.add (global.get $worddoc_ptr) (i32.mul (local.get $bte_pn) (i32.const 512)))
+        )
+
+        ;; cpara = last byte
+        (local.set $cpara (call $read_u8 (i32.add (local.get $fkp_ptr) (i32.const 511))))
+
+        ;; PapxFkp layout:
+        ;; rgfc: (cpara+1) u32 at start
+        ;; rgbx: cpara * 13-byte records starting at (cpara+1)*4
+        ;; Each BX: 1 byte bOffset (word offset into FKP) + 12 bytes PHE (ignored)
+
+        (local.set $j (i32.const 0))
+        (block $run_done
+          (loop $run_loop
+            (br_if $run_done (i32.ge_u (local.get $j) (local.get $cpara)))
+
+            (local.set $rgfc_j
+              (call $read_u32_le
+                (i32.add (local.get $fkp_ptr) (i32.mul (local.get $j) (i32.const 4)))
+              )
+            )
+            (local.set $rgfc_j1
+              (call $read_u32_le
+                (i32.add (local.get $fkp_ptr) (i32.mul (i32.add (local.get $j) (i32.const 1)) (i32.const 4)))
+              )
+            )
+
+            (local.set $cp_start (call $fc_to_cp (local.get $rgfc_j)))
+            (local.set $cp_end (call $fc_to_cp (local.get $rgfc_j1)))
+
+            ;; BX: bOffset at (cpara+1)*4 + j*13
+            (local.set $papx_off_byte
+              (call $read_u8
+                (i32.add (local.get $fkp_ptr)
+                  (i32.add
+                    (i32.mul (i32.add (local.get $cpara) (i32.const 1)) (i32.const 4))
+                    (i32.mul (local.get $j) (i32.const 13))
+                  )
+                )
+              )
+            )
+
+            ;; Defaults
+            (local.set $alignment (i32.const 0))
+            (local.set $space_before (i32.const 0))
+            (local.set $space_after (i32.const 0))
+            (local.set $first_indent (i32.const 0))
+
+            (if (local.get $papx_off_byte)
+              (then
+                ;; PAPX at fkp_ptr + papx_off_byte * 2
+                (local.set $papx_ptr
+                  (i32.add (local.get $fkp_ptr) (i32.mul (local.get $papx_off_byte) (i32.const 2)))
+                )
+                ;; First byte = cb (count of bytes). If 0, the second byte is cb2 and grpprl starts at +2
+                (local.set $papx_word_count (call $read_u8 (local.get $papx_ptr)))
+                (if (local.get $papx_word_count)
+                  (then
+                    ;; cb * 2 - 1 = total PAPX size after cb byte
+                    ;; First 2 bytes after cb = istd
+                    (local.set $grpprl_ptr (i32.add (local.get $papx_ptr) (i32.const 3)))
+                    (local.set $grpprl_len
+                      (i32.sub (i32.sub (i32.mul (local.get $papx_word_count) (i32.const 2)) (i32.const 1)) (i32.const 2))
+                    )
+                  )
+                  (else
+                    ;; cb=0: next byte is cb2
+                    (local.set $papx_word_count (call $read_u8 (i32.add (local.get $papx_ptr) (i32.const 1))))
+                    (local.set $grpprl_ptr (i32.add (local.get $papx_ptr) (i32.const 4)))
+                    (local.set $grpprl_len
+                      (i32.sub (i32.sub (i32.mul (local.get $papx_word_count) (i32.const 2)) (i32.const 1)) (i32.const 2))
+                    )
+                  )
+                )
+
+                (if (i32.gt_s (local.get $grpprl_len) (i32.const 0))
+                  (then
+                    (call $parse_pap_sprms
+                      (local.get $grpprl_ptr) (local.get $grpprl_len)
+                      (local.get $alignment) (local.get $space_before)
+                      (local.get $space_after) (local.get $first_indent)
+                    )
+                    (local.set $first_indent)
+                    (local.set $space_after)
+                    (local.set $space_before)
+                    (local.set $alignment)
+                  )
+                )
+              )
+            )
+
+            (if (i32.and
+                  (i32.ge_s (local.get $cp_start) (i32.const 0))
+                  (i32.gt_s (local.get $cp_end) (local.get $cp_start))
+                )
+              (then
+                (call $write_pap_run
+                  (global.get $pap_run_count)
+                  (local.get $cp_start) (local.get $cp_end)
+                  (local.get $alignment) (local.get $space_before)
+                  (local.get $space_after) (local.get $first_indent)
+                )
+                (global.set $pap_run_count (i32.add (global.get $pap_run_count) (i32.const 1)))
+              )
+            )
+
+            (local.set $j (i32.add (local.get $j) (i32.const 1)))
+            (br $run_loop)
+          )
+        )
+
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $bte_loop)
+      )
+    )
+
+    ;; Default if none found
+    (if (i32.eqz (global.get $pap_run_count))
+      (then
+        (call $write_pap_run (i32.const 0) (i32.const 0)
+          (i32.div_u (global.get $text_len) (i32.const 2))
+          (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0))
+        (global.set $pap_run_count (i32.const 1))
+      )
+    )
+  )
+
+  ;; ── Layout Engine ───────────────────────────────────────────
+  ;; Builds layout data at LAYOUT_BASE.
+  ;; Uses $measureText import for line breaking.
+  ;;
+  ;; Layout format:
+  ;; HEADER (16 bytes): page_count(u32), total_lines(u32), reserved(u32), reserved(u32)
+  ;; Then per page: PAGE_HDR (16 bytes): page_idx(u32), line_count(u32), y_start(f32), reserved(u32)
+  ;; Then per line: LINE (16 bytes): y_pos(f32), seg_count(u32), x_start(f32), line_width(f32)
+  ;; Then per segment: SEG (24 bytes): text_ptr(u32), text_len(u32), x_pos(f32), font_size(u32), flags(u32), color(u32)
+  ;;
+  ;; For simplicity in this pass, we use a flat array of segments grouped by page.
+  ;; We store segments sequentially and track page boundaries.
+
+  ;; Layout constants
+  ;; Page: 8.5 x 11 inches at 96 DPI = 816 x 1056 px
+  ;; Margins: 1 inch = 96 px
+  (global $PAGE_WIDTH_PX  f32 (f32.const 816.0))
+  (global $PAGE_HEIGHT_PX f32 (f32.const 1056.0))
+  (global $MARGIN_PX      f32 (f32.const 96.0))
+
+  ;; Layout segment: 24 bytes
+  ;; [0..3]   text_ptr (i32) — pointer into wasm memory
+  ;; [4..7]   text_len (i32) — bytes (UTF-16LE)
+  ;; [8..11]  x_pos (f32)
+  ;; [12..15] y_pos (f32)
+  ;; [16..19] flags (i32) — font_size in high 16, fmt flags in low 16
+  ;; [20..23] color (i32)
+
+  (global $layout_seg_count (mut i32) (i32.const 0))
+
+  ;; Page info: store (start_seg_idx, seg_count) per page at LAYOUT_BASE
+  ;; Page table: starts at LAYOUT_BASE, each entry 8 bytes
+  ;; Max 1000 pages
+  ;; Segment data: starts at LAYOUT_BASE + 8000
+
+  (global $LAYOUT_PAGE_TABLE i32 (i32.const 0x002B4000))
+  (global $LAYOUT_SEG_DATA   i32 (i32.const 0x002B5F40))  ;; +8000
+
+  (func $write_layout_seg (param $idx i32) (param $text_ptr i32) (param $text_len i32)
+                           (param $x f32) (param $y f32) (param $flags_and_size i32) (param $color i32)
+    (local $ptr i32)
+    (local.set $ptr (i32.add (global.get $LAYOUT_SEG_DATA) (i32.mul (local.get $idx) (i32.const 24))))
+    (i32.store (local.get $ptr) (local.get $text_ptr))
+    (i32.store (i32.add (local.get $ptr) (i32.const 4)) (local.get $text_len))
+    (f32.store (i32.add (local.get $ptr) (i32.const 8)) (local.get $x))
+    (f32.store (i32.add (local.get $ptr) (i32.const 12)) (local.get $y))
+    (i32.store (i32.add (local.get $ptr) (i32.const 16)) (local.get $flags_and_size))
+    (i32.store (i32.add (local.get $ptr) (i32.const 20)) (local.get $color))
+  )
+
+  ;; Find which CHP run covers a given CP
+  (func $find_chp_at_cp (param $cp i32) (result i32)
+    ;; Returns index into CHP_BASE, or 0 if not found (uses first run as default)
+    (local $i i32)
+    (local $ptr i32)
+    (local $start i32)
+    (local $end i32)
+    (local.set $i (i32.const 0))
+    (block $done
+      (loop $loop
+        (br_if $done (i32.ge_u (local.get $i) (global.get $chp_run_count)))
+        (local.set $ptr (i32.add (global.get $CHP_BASE) (i32.mul (local.get $i) (i32.const 28))))
+        (local.set $start (i32.load (local.get $ptr)))
+        (local.set $end (i32.load (i32.add (local.get $ptr) (i32.const 4))))
+        (if (i32.and
+              (i32.ge_s (local.get $cp) (local.get $start))
+              (i32.lt_s (local.get $cp) (local.get $end))
+            )
+          (then (return (local.get $i)))
+        )
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $loop)
+      )
+    )
+    (i32.const 0)
+  )
+
+  ;; Twips to pixels: px = twips * 96 / 1440
+  (func $twips_to_px (param $twips i32) (result f32)
+    (f32.div
+      (f32.mul (f32.convert_i32_s (local.get $twips)) (f32.const 96.0))
+      (f32.const 1440.0)
+    )
+  )
+
+  (func $do_layout
+    (local $total_cps i32)         ;; total character positions
+    (local $cp i32)                ;; current character position
+    (local $cur_x f32)             ;; current x position
+    (local $cur_y f32)             ;; current y position
+    (local $content_width f32)     ;; page width - 2*margin
+    (local $content_height f32)    ;; page height - 2*margin
+    (local $line_height f32)       ;; current line height
+    (local $page_num i32)
+    (local $page_start_seg i32)
+    (local $seg_count_on_page i32)
+    (local $word_start i32)        ;; CP of word start
+    (local $word_end i32)
+    (local $in_field i32)          ;; 1 = inside field instruction (skip)
+    (local $char_code i32)
+    (local $chp_idx i32)
+    (local $chp_ptr i32)
+    (local $chp_flags i32)
+    (local $chp_size i32)
+    (local $chp_color i32)
+    (local $word_width f32)
+    (local $word_text_ptr i32)
+    (local $word_text_len i32)
+    (local $flags_and_size i32)
+    (local $font_height f32)
+    (local $space_width f32)
+    (local $pap_idx i32)
+    (local $pap_ptr i32)
+    (local $pap_space_after i32)
+
+    (local.set $total_cps (i32.div_u (global.get $text_len) (i32.const 2)))
+    (local.set $content_width (f32.sub (global.get $PAGE_WIDTH_PX) (f32.mul (global.get $MARGIN_PX) (f32.const 2.0))))
+    (local.set $content_height (f32.sub (global.get $PAGE_HEIGHT_PX) (f32.mul (global.get $MARGIN_PX) (f32.const 2.0))))
+
+    (local.set $cur_x (global.get $MARGIN_PX))
+    (local.set $cur_y (global.get $MARGIN_PX))
+    (local.set $line_height (f32.const 16.0))  ;; default ~12pt
+    (local.set $page_num (i32.const 0))
+    (local.set $page_start_seg (i32.const 0))
+    (local.set $seg_count_on_page (i32.const 0))
+    (global.set $layout_seg_count (i32.const 0))
+
+    (local.set $cp (i32.const 0))
+
+    (block $all_done
+      (loop $cp_loop
+        (br_if $all_done (i32.ge_u (local.get $cp) (local.get $total_cps)))
+
+        ;; Read character at cp
+        (local.set $char_code
+          (call $read_u16_le
+            (i32.add (global.get $text_ptr) (i32.mul (local.get $cp) (i32.const 2)))
+          )
+        )
+
+        ;; Handle field codes: 0x13=begin, 0x14=separator, 0x15=end
+        ;; Skip field instructions (between 0x13 and 0x14), show field results
+        (if (i32.eq (local.get $char_code) (i32.const 0x13))
+          (then
+            (local.set $in_field (i32.const 1))
+            (local.set $cp (i32.add (local.get $cp) (i32.const 1)))
+            (br $cp_loop)
+          )
+        )
+        (if (i32.eq (local.get $char_code) (i32.const 0x14))
+          (then
+            (local.set $in_field (i32.const 0))
+            (local.set $cp (i32.add (local.get $cp) (i32.const 1)))
+            (br $cp_loop)
+          )
+        )
+        (if (i32.eq (local.get $char_code) (i32.const 0x15))
+          (then
+            (local.set $in_field (i32.const 0))
+            (local.set $cp (i32.add (local.get $cp) (i32.const 1)))
+            (br $cp_loop)
+          )
+        )
+        ;; Skip if inside field instruction
+        (if (local.get $in_field)
+          (then
+            (local.set $cp (i32.add (local.get $cp) (i32.const 1)))
+            (br $cp_loop)
+          )
+        )
+
+        ;; Handle paragraph break (0x0D = carriage return)
+        (if (i32.eq (local.get $char_code) (i32.const 0x0D))
+          (then
+            ;; New line after paragraph
+            ;; Get PAP space_after for this paragraph
+            ;; Simple: just add line height + some spacing
+            (local.set $cur_y (f32.add (local.get $cur_y) (f32.add (local.get $line_height) (f32.const 4.0))))
+            (local.set $cur_x (global.get $MARGIN_PX))
+            (local.set $line_height (f32.const 16.0))
+
+            ;; Page break check
+            (if (f32.ge (local.get $cur_y) (f32.sub (global.get $PAGE_HEIGHT_PX) (global.get $MARGIN_PX)))
+              (then
+                ;; Save page info
+                (i32.store
+                  (i32.add (global.get $LAYOUT_PAGE_TABLE) (i32.mul (local.get $page_num) (i32.const 8)))
+                  (local.get $page_start_seg)
+                )
+                (i32.store
+                  (i32.add (global.get $LAYOUT_PAGE_TABLE) (i32.add (i32.mul (local.get $page_num) (i32.const 8)) (i32.const 4)))
+                  (local.get $seg_count_on_page)
+                )
+                (local.set $page_num (i32.add (local.get $page_num) (i32.const 1)))
+                (local.set $page_start_seg (global.get $layout_seg_count))
+                (local.set $seg_count_on_page (i32.const 0))
+                (local.set $cur_y (global.get $MARGIN_PX))
+                (local.set $cur_x (global.get $MARGIN_PX))
+              )
+            )
+
+            (local.set $cp (i32.add (local.get $cp) (i32.const 1)))
+            (br $cp_loop)
+          )
+        )
+
+        ;; Handle page break (0x0C)
+        (if (i32.eq (local.get $char_code) (i32.const 0x0C))
+          (then
+            (i32.store
+              (i32.add (global.get $LAYOUT_PAGE_TABLE) (i32.mul (local.get $page_num) (i32.const 8)))
+              (local.get $page_start_seg)
+            )
+            (i32.store
+              (i32.add (global.get $LAYOUT_PAGE_TABLE) (i32.add (i32.mul (local.get $page_num) (i32.const 8)) (i32.const 4)))
+              (local.get $seg_count_on_page)
+            )
+            (local.set $page_num (i32.add (local.get $page_num) (i32.const 1)))
+            (local.set $page_start_seg (global.get $layout_seg_count))
+            (local.set $seg_count_on_page (i32.const 0))
+            (local.set $cur_y (global.get $MARGIN_PX))
+            (local.set $cur_x (global.get $MARGIN_PX))
+            (local.set $cp (i32.add (local.get $cp) (i32.const 1)))
+            (br $cp_loop)
+          )
+        )
+
+        ;; Skip control characters and special Word markers
+        ;; 0x01=embedded obj, 0x07=cell mark, 0x08=drawn obj, 0x0A=LF, etc.
+        (if (i32.lt_u (local.get $char_code) (i32.const 0x20))
+          (then
+            ;; Tab (0x09): advance x by ~4 spaces worth
+            (if (i32.eq (local.get $char_code) (i32.const 0x09))
+              (then
+                (local.set $cur_x (f32.add (local.get $cur_x) (f32.const 48.0)))
+              )
+            )
+            (local.set $cp (i32.add (local.get $cp) (i32.const 1)))
+            (br $cp_loop)
+          )
+        )
+
+        ;; Find word boundary (sequence of non-space, non-control chars)
+        (local.set $word_start (local.get $cp))
+        (block $word_done
+          (loop $word_loop
+            (br_if $word_done (i32.ge_u (local.get $cp) (local.get $total_cps)))
+            (local.set $char_code
+              (call $read_u16_le
+                (i32.add (global.get $text_ptr) (i32.mul (local.get $cp) (i32.const 2)))
+              )
+            )
+            ;; Break on space, CR, LF, tab, page break
+            (br_if $word_done (i32.eq (local.get $char_code) (i32.const 0x20)))
+            (br_if $word_done (i32.eq (local.get $char_code) (i32.const 0x0D)))
+            (br_if $word_done (i32.eq (local.get $char_code) (i32.const 0x0A)))
+            (br_if $word_done (i32.eq (local.get $char_code) (i32.const 0x09)))
+            (br_if $word_done (i32.eq (local.get $char_code) (i32.const 0x0C)))
+            (br_if $word_done (i32.lt_u (local.get $char_code) (i32.const 0x20)))
+            (local.set $cp (i32.add (local.get $cp) (i32.const 1)))
+            (br $word_loop)
+          )
+        )
+        (local.set $word_end (local.get $cp))
+
+        ;; Skip if empty word
+        (if (i32.le_u (local.get $word_end) (local.get $word_start))
+          (then
+            ;; It's a space or tab — advance
+            (if (i32.lt_u (local.get $cp) (local.get $total_cps))
+              (then (local.set $cp (i32.add (local.get $cp) (i32.const 1))))
+            )
+            (br $cp_loop)
+          )
+        )
+
+        ;; Get CHP for this word
+        (local.set $chp_idx (call $find_chp_at_cp (local.get $word_start)))
+        (local.set $chp_ptr (i32.add (global.get $CHP_BASE) (i32.mul (local.get $chp_idx) (i32.const 28))))
+        (local.set $chp_flags (i32.load (i32.add (local.get $chp_ptr) (i32.const 8))))
+        (local.set $chp_size (i32.load (i32.add (local.get $chp_ptr) (i32.const 12))))
+        (local.set $chp_color (i32.load (i32.add (local.get $chp_ptr) (i32.const 16))))
+
+        ;; Set font for measurement
+        (call $setFont (local.get $chp_size)
+          (i32.and (local.get $chp_flags) (i32.const 1))
+          (i32.and (i32.shr_u (local.get $chp_flags) (i32.const 1)) (i32.const 1))
+        )
+
+        ;; Measure word
+        (local.set $word_text_ptr
+          (i32.add (global.get $text_ptr) (i32.mul (local.get $word_start) (i32.const 2)))
+        )
+        (local.set $word_text_len
+          (i32.mul (i32.sub (local.get $word_end) (local.get $word_start)) (i32.const 2))
+        )
+        (local.set $word_width
+          (call $measureText (local.get $word_text_ptr) (local.get $word_text_len))
+        )
+
+        ;; Font height in pixels (half-points / 2 * 96/72 = half-points * 2/3)
+        (local.set $font_height
+          (f32.mul (f32.convert_i32_u (local.get $chp_size)) (f32.const 0.6667))
+        )
+
+        ;; Measure space
+        ;; Approximate space width as font_height * 0.3
+        (local.set $space_width (f32.mul (local.get $font_height) (f32.const 0.3)))
+
+        ;; Line break check: if word doesn't fit on current line
+        (if (f32.gt
+              (f32.add (local.get $cur_x) (local.get $word_width))
+              (f32.sub (global.get $PAGE_WIDTH_PX) (global.get $MARGIN_PX))
+            )
+          (then
+            ;; Wrap to next line
+            (local.set $cur_y (f32.add (local.get $cur_y) (local.get $line_height)))
+            (local.set $cur_x (global.get $MARGIN_PX))
+            (local.set $line_height (f32.const 16.0))
+
+            ;; Page break check
+            (if (f32.ge (local.get $cur_y) (f32.sub (global.get $PAGE_HEIGHT_PX) (global.get $MARGIN_PX)))
+              (then
+                (i32.store
+                  (i32.add (global.get $LAYOUT_PAGE_TABLE) (i32.mul (local.get $page_num) (i32.const 8)))
+                  (local.get $page_start_seg)
+                )
+                (i32.store
+                  (i32.add (global.get $LAYOUT_PAGE_TABLE) (i32.add (i32.mul (local.get $page_num) (i32.const 8)) (i32.const 4)))
+                  (local.get $seg_count_on_page)
+                )
+                (local.set $page_num (i32.add (local.get $page_num) (i32.const 1)))
+                (local.set $page_start_seg (global.get $layout_seg_count))
+                (local.set $seg_count_on_page (i32.const 0))
+                (local.set $cur_y (global.get $MARGIN_PX))
+              )
+            )
+          )
+        )
+
+        ;; Update line height to max of current and this font
+        (if (f32.gt (local.get $font_height) (local.get $line_height))
+          (then (local.set $line_height (local.get $font_height)))
+        )
+
+        ;; Write segment
+        ;; Pack font_size into high 16 bits of flags_and_size, format flags in low 16
+        (local.set $flags_and_size
+          (i32.or (local.get $chp_flags) (i32.shl (local.get $chp_size) (i32.const 16)))
+        )
+
+        (call $write_layout_seg
+          (global.get $layout_seg_count)
+          (local.get $word_text_ptr)
+          (local.get $word_text_len)
+          (local.get $cur_x)
+          (local.get $cur_y)
+          (local.get $flags_and_size)
+          (local.get $chp_color)
+        )
+        (global.set $layout_seg_count (i32.add (global.get $layout_seg_count) (i32.const 1)))
+        (local.set $seg_count_on_page (i32.add (local.get $seg_count_on_page) (i32.const 1)))
+
+        ;; Advance x by word width + space
+        (local.set $cur_x (f32.add (local.get $cur_x) (f32.add (local.get $word_width) (local.get $space_width))))
+
+        ;; Skip trailing space
+        (if (i32.lt_u (local.get $cp) (local.get $total_cps))
+          (then
+            (local.set $char_code
+              (call $read_u16_le
+                (i32.add (global.get $text_ptr) (i32.mul (local.get $cp) (i32.const 2)))
+              )
+            )
+            (if (i32.eq (local.get $char_code) (i32.const 0x20))
+              (then (local.set $cp (i32.add (local.get $cp) (i32.const 1))))
+            )
+          )
+        )
+
+        (br $cp_loop)
+      )
+    )
+
+    ;; Save last page
+    (i32.store
+      (i32.add (global.get $LAYOUT_PAGE_TABLE) (i32.mul (local.get $page_num) (i32.const 8)))
+      (local.get $page_start_seg)
+    )
+    (i32.store
+      (i32.add (global.get $LAYOUT_PAGE_TABLE) (i32.add (i32.mul (local.get $page_num) (i32.const 8)) (i32.const 4)))
+      (local.get $seg_count_on_page)
+    )
+
+    (global.set $page_count (i32.add (local.get $page_num) (i32.const 1)))
+  )
+
+  ;; ── Render ──────────────────────────────────────────────────
+  ;; Walk layout segments for the requested page and call canvas imports
 
   (func $render (param $page i32)
-    ;; TODO: Walk layout data and call canvas imports
-    ;; For now, just render extracted text on page 0
-    (if (i32.eqz (local.get $page))
-      (then
-        (call $setPage (i32.const 0) (f32.const 816.0) (f32.const 1056.0))  ;; 8.5x11 at 96dpi
-        (call $setFont (i32.const 24) (i32.const 0) (i32.const 0))  ;; 12pt
-        (call $setColor (i32.const 0x000000))
-        (call $fillText
-          (global.get $text_ptr)
-          (global.get $text_len)
-          (f32.const 72.0)   ;; ~1 inch margin
-          (f32.const 72.0)
+    (local $page_info_ptr i32)
+    (local $start_seg i32)
+    (local $seg_count i32)
+    (local $i i32)
+    (local $seg_ptr i32)
+    (local $text_ptr_val i32)
+    (local $text_len_val i32)
+    (local $x f32)
+    (local $y f32)
+    (local $flags_and_size i32)
+    (local $flags i32)
+    (local $font_size i32)
+    (local $color i32)
+
+    ;; Bounds check
+    (if (i32.ge_u (local.get $page) (global.get $page_count))
+      (then (return))
+    )
+
+    ;; Set up page canvas
+    (call $setPage (local.get $page) (global.get $PAGE_WIDTH_PX) (global.get $PAGE_HEIGHT_PX))
+
+    ;; Read page table entry
+    (local.set $page_info_ptr
+      (i32.add (global.get $LAYOUT_PAGE_TABLE) (i32.mul (local.get $page) (i32.const 8)))
+    )
+    (local.set $start_seg (i32.load (local.get $page_info_ptr)))
+    (local.set $seg_count (i32.load (i32.add (local.get $page_info_ptr) (i32.const 4))))
+
+    ;; Render each segment
+    (local.set $i (i32.const 0))
+    (block $done
+      (loop $loop
+        (br_if $done (i32.ge_u (local.get $i) (local.get $seg_count)))
+
+        (local.set $seg_ptr
+          (i32.add (global.get $LAYOUT_SEG_DATA)
+            (i32.mul (i32.add (local.get $start_seg) (local.get $i)) (i32.const 24))
+          )
         )
+
+        (local.set $text_ptr_val (i32.load (local.get $seg_ptr)))
+        (local.set $text_len_val (i32.load (i32.add (local.get $seg_ptr) (i32.const 4))))
+        (local.set $x (f32.load (i32.add (local.get $seg_ptr) (i32.const 8))))
+        (local.set $y (f32.load (i32.add (local.get $seg_ptr) (i32.const 12))))
+        (local.set $flags_and_size (i32.load (i32.add (local.get $seg_ptr) (i32.const 16))))
+        (local.set $color (i32.load (i32.add (local.get $seg_ptr) (i32.const 20))))
+
+        ;; Unpack
+        (local.set $flags (i32.and (local.get $flags_and_size) (i32.const 0xFFFF)))
+        (local.set $font_size (i32.shr_u (local.get $flags_and_size) (i32.const 16)))
+
+        ;; Set font and color
+        (call $setFont (local.get $font_size)
+          (i32.and (local.get $flags) (i32.const 1))
+          (i32.and (i32.shr_u (local.get $flags) (i32.const 1)) (i32.const 1))
+        )
+        (call $setColor (local.get $color))
+
+        ;; Draw text (y needs offset by font ascent — approximate as font_height * 0.8)
+        (call $fillText
+          (local.get $text_ptr_val)
+          (local.get $text_len_val)
+          (local.get $x)
+          (f32.add (local.get $y)
+            (f32.mul (f32.convert_i32_u (local.get $font_size)) (f32.const 0.5333))
+          )
+        )
+
+        ;; Underline (bit 2)
+        (if (i32.and (local.get $flags) (i32.const 4))
+          (then
+            (call $setColor (local.get $color))
+            (call $fillRect
+              (local.get $x)
+              (f32.add (local.get $y)
+                (f32.mul (f32.convert_i32_u (local.get $font_size)) (f32.const 0.5667))
+              )
+              ;; Width: use measureText
+              (call $measureText (local.get $text_ptr_val) (local.get $text_len_val))
+              (f32.const 1.0)
+            )
+          )
+        )
+
+        ;; Strikethrough (bit 3)
+        (if (i32.and (local.get $flags) (i32.const 8))
+          (then
+            (call $setColor (local.get $color))
+            (call $fillRect
+              (local.get $x)
+              (f32.add (local.get $y)
+                (f32.mul (f32.convert_i32_u (local.get $font_size)) (f32.const 0.3))
+              )
+              (call $measureText (local.get $text_ptr_val) (local.get $text_len_val))
+              (f32.const 1.0)
+            )
+          )
+        )
+
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $loop)
       )
     )
   )

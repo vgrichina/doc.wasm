@@ -13,6 +13,15 @@
     }
     #drop-zone.dragover { border-color: #333; background: #e0e0e0; }
     #status { margin-bottom: 12px; font-size: 14px; color: #444; }
+    #page-nav {
+      text-align: center; margin: 12px 0;
+    }
+    #page-nav button {
+      padding: 6px 16px; margin: 0 8px; cursor: pointer;
+      border: 1px solid #999; border-radius: 4px; background: white;
+    }
+    #page-nav button:disabled { opacity: 0.4; cursor: default; }
+    #page-info { display: inline; font-size: 14px; color: #444; }
     #doc-canvas {
       background: white; box-shadow: 0 2px 8px rgba(0,0,0,0.15);
       display: block; margin: 0 auto;
@@ -28,6 +37,11 @@
 <body>
   <div id="drop-zone">Drop a .doc file here (or click to browse)</div>
   <div id="status">Loading wasm...</div>
+  <div id="page-nav">
+    <button id="prev-page" disabled>&larr; Prev</button>
+    <span id="page-info"></span>
+    <button id="next-page" disabled>Next &rarr;</button>
+  </div>
   <canvas id="doc-canvas" width="816" height="1056"></canvas>
   <div id="text-output"></div>
   <script type="module" src="js/browser.js"></script>

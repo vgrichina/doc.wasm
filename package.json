@@ -1,0 +1,9 @@
+{
+  "name": "doc-wasm",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "canvas": "^3.2.2"
+  }
+}
