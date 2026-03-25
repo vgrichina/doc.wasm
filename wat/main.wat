@@ -40,6 +40,10 @@
   (global $arena_base (mut i32) (i32.const 0x004C0000))  ;; page-aligned after fixed
   (global $arena_ptr  (mut i32) (i32.const 0x004C0000))
 
+  ;; Mini-stream container (root entry's data read via FAT)
+  (global $mini_stream_ptr (mut i32) (i32.const 0))
+  (global $mini_stream_len (mut i32) (i32.const 0))
+
   ;; Parsed stream pointers (set during parse)
   (global $worddoc_ptr (mut i32) (i32.const 0))
   (global $worddoc_len (mut i32) (i32.const 0))
@@ -309,26 +313,61 @@
     (local.get $offset)
   )
 
-  ;; Read a mini-stream via mini-FAT chain into dest
+  ;; Read a mini-stream via mini-FAT chain into dest.
+  ;; Mini-stream sectors are 64 bytes each, stored inside the root entry's stream
+  ;; which has been read into $mini_stream_ptr via FAT.
   (func $read_mini_stream (param $start_sector i32) (param $size i32) (param $dest i32) (result i32)
     (local $sector i32)
     (local $remaining i32)
     (local $chunk i32)
     (local $offset i32)
     (local $mini_offset i32)
-    ;; The mini-stream is the data of the root entry, already read via FAT
-    ;; We need to read from the root entry's stream
-    ;; For now, we read mini sectors from the root entry stream which
-    ;; has been copied to a temporary location
 
-    ;; Actually, mini-stream sectors are 64 bytes each, residing inside
-    ;; the root entry's regular stream. We need to locate byte offset
-    ;; mini_sector * 64 within that stream.
+    (local.set $sector (local.get $start_sector))
+    (local.set $remaining (local.get $size))
+    (local.set $offset (i32.const 0))
 
-    ;; This requires the root entry stream to be read first.
-    ;; We'll handle this properly during CFBF parse.
-    ;; For now, stub:
-    (local.get $size)
+    (block $done
+      (loop $loop
+        (br_if $done (i32.le_s (local.get $remaining) (i32.const 0)))
+        (br_if $done (i32.ge_u (local.get $sector) (i32.const 0xFFFFFFFE)))
+
+        ;; Byte offset within mini-stream container
+        (local.set $mini_offset (i32.mul (local.get $sector) (i32.const 64)))
+
+        ;; Chunk = min(64, remaining)
+        (local.set $chunk (i32.const 64))
+        (if (i32.lt_u (local.get $remaining) (i32.const 64))
+          (then (local.set $chunk (local.get $remaining)))
+        )
+
+        ;; Copy from mini-stream container
+        (call $memcpy
+          (i32.add (local.get $dest) (local.get $offset))
+          (i32.add (global.get $mini_stream_ptr) (local.get $mini_offset))
+          (local.get $chunk)
+        )
+
+        (local.set $offset (i32.add (local.get $offset) (local.get $chunk)))
+        (local.set $remaining (i32.sub (local.get $remaining) (local.get $chunk)))
+        (local.set $sector (call $minifat_next (local.get $sector)))
+        (br $loop)
+      )
+    )
+
+    (local.get $offset)
+  )
+
+  ;; Read a stream, choosing FAT or mini-FAT based on size
+  (func $read_stream_auto (param $start_sector i32) (param $size i32) (param $dest i32) (result i32)
+    (if (result i32) (i32.lt_u (local.get $size) (global.get $MINI_STREAM_CUTOFF))
+      (then
+        (call $read_mini_stream (local.get $start_sector) (local.get $size) (local.get $dest))
+      )
+      (else
+        (call $read_stream (local.get $start_sector) (local.get $size) (local.get $dest))
+      )
+    )
   )
 
   ;; Parse CFBF header
@@ -948,7 +987,76 @@
     ;; Set text length
     (global.set $text_len (i32.sub (local.get $dst) (global.get $text_ptr)))
 
+    ;; Filter out field codes from extracted text
+    (call $filter_field_codes)
+
     (global.get $ERR_NONE)
+  )
+
+  ;; ── Field code filter ───────────────────────────────────────
+  ;; Remove field instruction text (between 0x13 and 0x14) from TEXT_BUFFER
+  ;; Keep field result text (between 0x14 and 0x15)
+  ;; Remove the 0x13, 0x14, 0x15 marker chars themselves
+  (func $filter_field_codes
+    (local $src i32)
+    (local $dst i32)
+    (local $end i32)
+    (local $ch i32)
+    (local $in_field i32)  ;; 1 = inside field instruction (skip)
+
+    (local.set $src (global.get $text_ptr))
+    (local.set $dst (global.get $text_ptr))
+    (local.set $end (i32.add (global.get $text_ptr) (global.get $text_len)))
+
+    (block $done
+      (loop $loop
+        (br_if $done (i32.ge_u (local.get $src) (local.get $end)))
+
+        (local.set $ch (call $read_u16_le (local.get $src)))
+
+        ;; 0x13 = field begin — start skipping
+        (if (i32.eq (local.get $ch) (i32.const 0x13))
+          (then
+            (local.set $in_field (i32.const 1))
+            (local.set $src (i32.add (local.get $src) (i32.const 2)))
+            (br $loop)
+          )
+        )
+        ;; 0x14 = field separator — stop skipping (show result)
+        (if (i32.eq (local.get $ch) (i32.const 0x14))
+          (then
+            (local.set $in_field (i32.const 0))
+            (local.set $src (i32.add (local.get $src) (i32.const 2)))
+            (br $loop)
+          )
+        )
+        ;; 0x15 = field end — stop skipping
+        (if (i32.eq (local.get $ch) (i32.const 0x15))
+          (then
+            (local.set $in_field (i32.const 0))
+            (local.set $src (i32.add (local.get $src) (i32.const 2)))
+            (br $loop)
+          )
+        )
+
+        ;; Skip if inside field instruction
+        (if (local.get $in_field)
+          (then
+            (local.set $src (i32.add (local.get $src) (i32.const 2)))
+            (br $loop)
+          )
+        )
+
+        ;; Copy character
+        (i32.store16 (local.get $dst) (local.get $ch))
+        (local.set $dst (i32.add (local.get $dst) (i32.const 2)))
+        (local.set $src (i32.add (local.get $src) (i32.const 2)))
+        (br $loop)
+      )
+    )
+
+    ;; Update text length
+    (global.set $text_len (i32.sub (local.get $dst) (global.get $text_ptr)))
   )
 
   ;; ── Main parse orchestrator ─────────────────────────────────
@@ -976,10 +1084,27 @@
       (return (local.get $err))
     ))
 
+    ;; Phase 2.5: Read mini-stream container (root entry's data via FAT)
+    ;; This is needed to read streams < 4096 bytes
+    (if (i32.and
+          (i32.gt_u (global.get $cfbf_mini_stream_size) (i32.const 0))
+          (i32.lt_u (global.get $cfbf_mini_stream_start) (i32.const 0xFFFFFFFE))
+        )
+      (then
+        (global.set $mini_stream_ptr (call $arena_alloc (global.get $cfbf_mini_stream_size)))
+        (global.set $mini_stream_len (global.get $cfbf_mini_stream_size))
+        (drop (call $read_stream
+          (global.get $cfbf_mini_stream_start)
+          (global.get $cfbf_mini_stream_size)
+          (global.get $mini_stream_ptr)
+        ))
+      )
+    )
+
     ;; Phase 3: Extract WordDocument stream
     (global.set $worddoc_ptr (call $arena_alloc (global.get $stream_worddoc_size)))
     (global.set $worddoc_len (global.get $stream_worddoc_size))
-    (drop (call $read_stream
+    (drop (call $read_stream_auto
       (global.get $stream_worddoc_start)
       (global.get $stream_worddoc_size)
       (global.get $worddoc_ptr)
@@ -1022,7 +1147,7 @@
     )
     (global.set $table_ptr (call $arena_alloc (local.get $tbl_size)))
     (global.set $table_len (local.get $tbl_size))
-    (drop (call $read_stream
+    (drop (call $read_stream_auto
       (local.get $tbl_start)
       (local.get $tbl_size)
       (global.get $table_ptr)
@@ -1033,7 +1158,7 @@
       (then
         (global.set $data_ptr (call $arena_alloc (global.get $stream_data_size)))
         (global.set $data_len (global.get $stream_data_size))
-        (drop (call $read_stream
+        (drop (call $read_stream_auto
           (global.get $stream_data_start)
           (global.get $stream_data_size)
           (global.get $data_ptr)
@@ -1061,7 +1186,10 @@
     ;; Phase 10: Parse PAP (paragraph properties)
     (call $parse_pap)
 
-    ;; Phase 11: Layout
+    ;; Phase 11: Parse SEP (section properties — page size, margins)
+    (call $parse_sep)
+
+    ;; Phase 12: Layout
     (call $do_layout)
 
     (global.set $error_code (global.get $ERR_NONE))
@@ -1777,6 +1905,155 @@
     )
   )
 
+  ;; ── SEP (Section Properties) Parser ─────────────────────────
+  ;; Parse PlcfSed to extract page dimensions and margins from the first section.
+  ;; SEPX format: cb(u16) + grpprl(cb bytes)
+  ;; Key sprms:
+  ;;   sprmSXaPage (page width twips)   = 0xB01F
+  ;;   sprmSYaPage (page height twips)  = 0xB020
+  ;;   sprmSDxaLeft (left margin twips) = 0xB021
+  ;;   sprmSDxaRight (right margin)     = 0xB022
+  ;;   sprmSDyaTop (top margin twips)   = 0x9023
+  ;;   sprmSDyaBottom (bottom margin)   = 0x9024
+
+  (func $parse_sep
+    (local $fc_plcfsed i32)
+    (local $lcb i32)
+    (local $plc_ptr i32)
+    (local $n i32)
+    (local $sed_ptr i32)
+    (local $fc_sepx i32)
+    (local $sepx_ptr i32)
+    (local $cb i32)
+    (local $pos i32)
+    (local $end i32)
+    (local $opcode i32)
+    (local $operand_size i32)
+    (local $page_w i32)
+    (local $page_h i32)
+    (local $margin_l i32)
+    (local $margin_r i32)
+    (local $margin_t i32)
+    (local $margin_b i32)
+
+    ;; Default page dimensions in twips (8.5x11 inches)
+    (local.set $page_w (i32.const 12240))
+    (local.set $page_h (i32.const 15840))
+    ;; Default margins: 1 inch = 1440 twips (Word default is 1" left/right, 1" top/bottom)
+    (local.set $margin_l (i32.const 1800))  ;; Word default is 1.25 inch = 1800 twips
+    (local.set $margin_r (i32.const 1800))
+    (local.set $margin_t (i32.const 1440))
+    (local.set $margin_b (i32.const 1440))
+
+    (local.set $fc_plcfsed (i32.load (i32.add (global.get $FIB_BASE) (i32.const 40))))
+    (local.set $lcb (i32.load (i32.add (global.get $FIB_BASE) (i32.const 44))))
+
+    ;; If no SED data, use defaults
+    (if (i32.eqz (local.get $lcb)) (then
+      (global.set $PAGE_WIDTH_PX (call $twips_to_px (local.get $page_w)))
+      (global.set $PAGE_HEIGHT_PX (call $twips_to_px (local.get $page_h)))
+      (global.set $MARGIN_LEFT_PX (call $twips_to_px (local.get $margin_l)))
+      (global.set $MARGIN_RIGHT_PX (call $twips_to_px (local.get $margin_r)))
+      (global.set $MARGIN_TOP_PX (call $twips_to_px (local.get $margin_t)))
+      (global.set $MARGIN_BOTTOM_PX (call $twips_to_px (local.get $margin_b)))
+      (global.set $MARGIN_PX (global.get $MARGIN_LEFT_PX))
+      (return)
+    ))
+
+    ;; PlcfSed: (n+1) CPs (u32) + n SEDs (12 bytes each)
+    ;; n = (lcb - 4) / 16
+    (local.set $plc_ptr (i32.add (global.get $table_ptr) (local.get $fc_plcfsed)))
+    (local.set $n (i32.div_u (i32.sub (local.get $lcb) (i32.const 4)) (i32.const 16)))
+
+    ;; Only parse first section (index 0)
+    (if (i32.gt_u (local.get $n) (i32.const 0))
+      (then
+        ;; SED[0] starts after (n+1) CPs
+        (local.set $sed_ptr
+          (i32.add (local.get $plc_ptr)
+            (i32.mul (i32.add (local.get $n) (i32.const 1)) (i32.const 4))
+          )
+        )
+
+        ;; SED format: fn(i16) + fcSepx(i32) + fnMpr(i16) + fcMpr(i32) = 12 bytes
+        ;; fcSepx at offset 2
+        (local.set $fc_sepx (call $read_u32_le (i32.add (local.get $sed_ptr) (i32.const 2))))
+
+        ;; fcSepx of 0xFFFFFFFF means no SEPX
+        (if (i32.lt_u (local.get $fc_sepx) (i32.const 0xFFFFFFFF))
+          (then
+            ;; SEPX is in the WordDocument stream
+            (local.set $sepx_ptr (i32.add (global.get $worddoc_ptr) (local.get $fc_sepx)))
+            ;; First 2 bytes = cb (grpprl byte count)
+            (local.set $cb (call $read_u16_le (local.get $sepx_ptr)))
+
+            (if (i32.gt_u (local.get $cb) (i32.const 0))
+              (then
+                (local.set $pos (i32.add (local.get $sepx_ptr) (i32.const 2)))
+                (local.set $end (i32.add (local.get $pos) (local.get $cb)))
+
+                (block $done
+                  (loop $loop
+                    (br_if $done (i32.ge_u (i32.add (local.get $pos) (i32.const 2)) (local.get $end)))
+
+                    (local.set $opcode (call $read_u16_le (local.get $pos)))
+                    (local.set $pos (i32.add (local.get $pos) (i32.const 2)))
+
+                    (local.set $operand_size (call $sprm_size (local.get $opcode)))
+                    (if (i32.eq (local.get $operand_size) (i32.const -1))
+                      (then
+                        (local.set $operand_size (call $read_u8 (local.get $pos)))
+                        (local.set $pos (i32.add (local.get $pos) (i32.const 1)))
+                      )
+                    )
+
+                    ;; sprmSXaPage = 0xB01F (page width)
+                    (if (i32.eq (local.get $opcode) (i32.const 0xB01F))
+                      (then (local.set $page_w (call $read_u16_le (local.get $pos))))
+                    )
+                    ;; sprmSYaPage = 0xB020 (page height)
+                    (if (i32.eq (local.get $opcode) (i32.const 0xB020))
+                      (then (local.set $page_h (call $read_u16_le (local.get $pos))))
+                    )
+                    ;; sprmSDxaLeft = 0xB021 (left margin)
+                    (if (i32.eq (local.get $opcode) (i32.const 0xB021))
+                      (then (local.set $margin_l (call $read_u16_le (local.get $pos))))
+                    )
+                    ;; sprmSDxaRight = 0xB022 (right margin)
+                    (if (i32.eq (local.get $opcode) (i32.const 0xB022))
+                      (then (local.set $margin_r (call $read_u16_le (local.get $pos))))
+                    )
+                    ;; sprmSDyaTop = 0x9023 (top margin, signed)
+                    (if (i32.eq (local.get $opcode) (i32.const 0x9023))
+                      (then (local.set $margin_t (i32.extend16_s (call $read_u16_le (local.get $pos)))))
+                    )
+                    ;; sprmSDyaBottom = 0x9024 (bottom margin, signed)
+                    (if (i32.eq (local.get $opcode) (i32.const 0x9024))
+                      (then (local.set $margin_b (i32.extend16_s (call $read_u16_le (local.get $pos)))))
+                    )
+
+                    (local.set $pos (i32.add (local.get $pos) (local.get $operand_size)))
+                    (br $loop)
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+
+    ;; Convert to pixels and set globals
+    (global.set $PAGE_WIDTH_PX (call $twips_to_px (local.get $page_w)))
+    (global.set $PAGE_HEIGHT_PX (call $twips_to_px (local.get $page_h)))
+    (global.set $MARGIN_LEFT_PX (call $twips_to_px (local.get $margin_l)))
+    (global.set $MARGIN_RIGHT_PX (call $twips_to_px (local.get $margin_r)))
+    (global.set $MARGIN_TOP_PX (call $twips_to_px (local.get $margin_t)))
+    (global.set $MARGIN_BOTTOM_PX (call $twips_to_px (local.get $margin_b)))
+    ;; Keep MARGIN_PX as left margin for backward compat
+    (global.set $MARGIN_PX (global.get $MARGIN_LEFT_PX))
+  )
+
   ;; ── Layout Engine ───────────────────────────────────────────
   ;; Builds layout data at LAYOUT_BASE.
   ;; Uses $measureText import for line breaking.
@@ -1790,12 +2067,16 @@
   ;; For simplicity in this pass, we use a flat array of segments grouped by page.
   ;; We store segments sequentially and track page boundaries.
 
-  ;; Layout constants
-  ;; Page: 8.5 x 11 inches at 96 DPI = 816 x 1056 px
-  ;; Margins: 1 inch = 96 px
-  (global $PAGE_WIDTH_PX  f32 (f32.const 816.0))
-  (global $PAGE_HEIGHT_PX f32 (f32.const 1056.0))
-  (global $MARGIN_PX      f32 (f32.const 96.0))
+  ;; Layout constants — defaults for 8.5 x 11 inches at 96 DPI
+  ;; These are mutable: SEP parsing may update them
+  (global $PAGE_WIDTH_PX  (mut f32) (f32.const 816.0))
+  (global $PAGE_HEIGHT_PX (mut f32) (f32.const 1056.0))
+  (global $MARGIN_PX      (mut f32) (f32.const 96.0))
+  ;; Separate margins for more accurate layout
+  (global $MARGIN_LEFT_PX   (mut f32) (f32.const 96.0))
+  (global $MARGIN_RIGHT_PX  (mut f32) (f32.const 96.0))
+  (global $MARGIN_TOP_PX    (mut f32) (f32.const 96.0))
+  (global $MARGIN_BOTTOM_PX (mut f32) (f32.const 96.0))
 
   ;; Layout segment: 24 bytes
   ;; [0..3]   text_ptr (i32) — pointer into wasm memory
@@ -1854,6 +2135,115 @@
     (i32.const 0)
   )
 
+  ;; Find PAP run index for a given CP
+  (func $find_pap_at_cp (param $cp i32) (result i32)
+    (local $i i32)
+    (local $ptr i32)
+    (local $start i32)
+    (local $end i32)
+    (local.set $i (i32.const 0))
+    (block $done
+      (loop $loop
+        (br_if $done (i32.ge_u (local.get $i) (global.get $pap_run_count)))
+        (local.set $ptr (i32.add (global.get $PAP_BASE) (i32.mul (local.get $i) (i32.const 28))))
+        (local.set $start (i32.load (local.get $ptr)))
+        (local.set $end (i32.load (i32.add (local.get $ptr) (i32.const 4))))
+        (if (i32.and
+              (i32.ge_s (local.get $cp) (local.get $start))
+              (i32.lt_s (local.get $cp) (local.get $end))
+            )
+          (then (return (local.get $i)))
+        )
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $loop)
+      )
+    )
+    (i32.const 0)
+  )
+
+  ;; Find PAP run for a given CP, returns alignment (0=left,1=center,2=right,3=justify)
+  (func $get_pap_alignment (param $cp i32) (result i32)
+    (local $i i32)
+    (local $ptr i32)
+    (local $start i32)
+    (local $end i32)
+    (local.set $i (i32.const 0))
+    (block $done
+      (loop $loop
+        (br_if $done (i32.ge_u (local.get $i) (global.get $pap_run_count)))
+        (local.set $ptr (i32.add (global.get $PAP_BASE) (i32.mul (local.get $i) (i32.const 28))))
+        (local.set $start (i32.load (local.get $ptr)))
+        (local.set $end (i32.load (i32.add (local.get $ptr) (i32.const 4))))
+        (if (i32.and
+              (i32.ge_s (local.get $cp) (local.get $start))
+              (i32.lt_s (local.get $cp) (local.get $end))
+            )
+          (then (return (i32.load (i32.add (local.get $ptr) (i32.const 8)))))
+        )
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $loop)
+      )
+    )
+    (i32.const 0)  ;; default left
+  )
+
+  ;; Adjust x positions of segments on a line for alignment
+  ;; Shifts segments [start_seg, end_seg) based on alignment and line width
+  (func $align_line (param $start_seg i32) (param $end_seg i32) (param $alignment i32) (param $line_end_x f32)
+    (local $i i32)
+    (local $seg_ptr i32)
+    (local $line_width f32)
+    (local $shift f32)
+    (local $content_right f32)
+
+    ;; Only adjust for center (1) or right (2)
+    (if (i32.eqz (local.get $alignment)) (then (return)))
+    (if (i32.ge_u (local.get $start_seg) (local.get $end_seg)) (then (return)))
+
+    (local.set $content_right (f32.sub (global.get $PAGE_WIDTH_PX) (global.get $MARGIN_RIGHT_PX)))
+    (local.set $line_width (f32.sub (local.get $line_end_x) (global.get $MARGIN_LEFT_PX)))
+
+    ;; Center: shift right by (available - used) / 2
+    (if (i32.eq (local.get $alignment) (i32.const 1))
+      (then
+        (local.set $shift
+          (f32.div
+            (f32.sub (f32.sub (local.get $content_right) (global.get $MARGIN_LEFT_PX)) (local.get $line_width))
+            (f32.const 2.0)
+          )
+        )
+      )
+    )
+    ;; Right: shift right by (available - used)
+    (if (i32.eq (local.get $alignment) (i32.const 2))
+      (then
+        (local.set $shift
+          (f32.sub (f32.sub (local.get $content_right) (global.get $MARGIN_LEFT_PX)) (local.get $line_width))
+        )
+      )
+    )
+
+    ;; Apply shift to all segments on this line
+    (if (f32.gt (local.get $shift) (f32.const 0.0))
+      (then
+        (local.set $i (local.get $start_seg))
+        (block $done
+          (loop $loop
+            (br_if $done (i32.ge_u (local.get $i) (local.get $end_seg)))
+            (local.set $seg_ptr
+              (i32.add (global.get $LAYOUT_SEG_DATA) (i32.mul (local.get $i) (i32.const 24)))
+            )
+            (f32.store (i32.add (local.get $seg_ptr) (i32.const 8))
+              (f32.add (f32.load (i32.add (local.get $seg_ptr) (i32.const 8))) (local.get $shift))
+            )
+            (local.set $i (i32.add (local.get $i) (i32.const 1)))
+            (br $loop)
+          )
+        )
+      )
+    )
+  )
+
   ;; Twips to pixels: px = twips * 96 / 1440
   (func $twips_to_px (param $twips i32) (result f32)
     (f32.div
@@ -1876,6 +2266,8 @@
     (local $word_start i32)        ;; CP of word start
     (local $word_end i32)
     (local $in_field i32)          ;; 1 = inside field instruction (skip)
+    (local $line_start_seg i32)    ;; first segment index of current line
+    (local $para_align i32)        ;; current paragraph alignment
     (local $char_code i32)
     (local $chp_idx i32)
     (local $chp_ptr i32)
@@ -1893,11 +2285,11 @@
     (local $pap_space_after i32)
 
     (local.set $total_cps (i32.div_u (global.get $text_len) (i32.const 2)))
-    (local.set $content_width (f32.sub (global.get $PAGE_WIDTH_PX) (f32.mul (global.get $MARGIN_PX) (f32.const 2.0))))
-    (local.set $content_height (f32.sub (global.get $PAGE_HEIGHT_PX) (f32.mul (global.get $MARGIN_PX) (f32.const 2.0))))
+    (local.set $content_width (f32.sub (global.get $PAGE_WIDTH_PX) (f32.add (global.get $MARGIN_LEFT_PX) (global.get $MARGIN_RIGHT_PX))))
+    (local.set $content_height (f32.sub (global.get $PAGE_HEIGHT_PX) (f32.add (global.get $MARGIN_TOP_PX) (global.get $MARGIN_BOTTOM_PX))))
 
-    (local.set $cur_x (global.get $MARGIN_PX))
-    (local.set $cur_y (global.get $MARGIN_PX))
+    (local.set $cur_x (global.get $MARGIN_LEFT_PX))
+    (local.set $cur_y (global.get $MARGIN_TOP_PX))
     (local.set $line_height (f32.const 16.0))  ;; default ~12pt
     (local.set $page_num (i32.const 0))
     (local.set $page_start_seg (i32.const 0))
@@ -1951,15 +2343,37 @@
         ;; Handle paragraph break (0x0D = carriage return)
         (if (i32.eq (local.get $char_code) (i32.const 0x0D))
           (then
-            ;; New line after paragraph
-            ;; Get PAP space_after for this paragraph
-            ;; Simple: just add line height + some spacing
-            (local.set $cur_y (f32.add (local.get $cur_y) (f32.add (local.get $line_height) (f32.const 4.0))))
-            (local.set $cur_x (global.get $MARGIN_PX))
+            ;; Align the current line before moving to next
+            (call $align_line
+              (local.get $line_start_seg)
+              (global.get $layout_seg_count)
+              (local.get $para_align)
+              (local.get $cur_x)
+            )
+
+            ;; Get PAP space_after for current paragraph
+            (local.set $pap_idx (call $find_pap_at_cp (local.get $cp)))
+            (local.set $pap_ptr (i32.add (global.get $PAP_BASE) (i32.mul (local.get $pap_idx) (i32.const 28))))
+            (local.set $pap_space_after (i32.load (i32.add (local.get $pap_ptr) (i32.const 16))))
+
+            ;; New line after paragraph: line_height + space_after (twips→px)
+            (local.set $cur_y (f32.add (local.get $cur_y)
+              (f32.add (local.get $line_height)
+                (if (result f32) (local.get $pap_space_after)
+                  (then (call $twips_to_px (local.get $pap_space_after)))
+                  (else (f32.const 4.0))
+                )
+              )
+            ))
+            (local.set $cur_x (global.get $MARGIN_LEFT_PX))
             (local.set $line_height (f32.const 16.0))
+            (local.set $line_start_seg (global.get $layout_seg_count))
+
+            ;; Update alignment for next paragraph
+            (local.set $para_align (call $get_pap_alignment (i32.add (local.get $cp) (i32.const 1))))
 
             ;; Page break check
-            (if (f32.ge (local.get $cur_y) (f32.sub (global.get $PAGE_HEIGHT_PX) (global.get $MARGIN_PX)))
+            (if (f32.ge (local.get $cur_y) (f32.sub (global.get $PAGE_HEIGHT_PX) (global.get $MARGIN_BOTTOM_PX)))
               (then
                 ;; Save page info
                 (i32.store
@@ -1973,8 +2387,8 @@
                 (local.set $page_num (i32.add (local.get $page_num) (i32.const 1)))
                 (local.set $page_start_seg (global.get $layout_seg_count))
                 (local.set $seg_count_on_page (i32.const 0))
-                (local.set $cur_y (global.get $MARGIN_PX))
-                (local.set $cur_x (global.get $MARGIN_PX))
+                (local.set $cur_y (global.get $MARGIN_TOP_PX))
+                (local.set $cur_x (global.get $MARGIN_LEFT_PX))
               )
             )
 
@@ -1997,8 +2411,8 @@
             (local.set $page_num (i32.add (local.get $page_num) (i32.const 1)))
             (local.set $page_start_seg (global.get $layout_seg_count))
             (local.set $seg_count_on_page (i32.const 0))
-            (local.set $cur_y (global.get $MARGIN_PX))
-            (local.set $cur_x (global.get $MARGIN_PX))
+            (local.set $cur_y (global.get $MARGIN_TOP_PX))
+            (local.set $cur_x (global.get $MARGIN_LEFT_PX))
             (local.set $cp (i32.add (local.get $cp) (i32.const 1)))
             (br $cp_loop)
           )
@@ -2020,7 +2434,10 @@
         )
 
         ;; Find word boundary (sequence of non-space, non-control chars)
+        ;; Also break at CHP run boundaries so mid-word formatting changes render correctly
         (local.set $word_start (local.get $cp))
+        (local.set $chp_idx (call $find_chp_at_cp (local.get $word_start)))
+        (local.set $chp_ptr (i32.add (global.get $CHP_BASE) (i32.mul (local.get $chp_idx) (i32.const 28))))
         (block $word_done
           (loop $word_loop
             (br_if $word_done (i32.ge_u (local.get $cp) (local.get $total_cps)))
@@ -2036,6 +2453,12 @@
             (br_if $word_done (i32.eq (local.get $char_code) (i32.const 0x09)))
             (br_if $word_done (i32.eq (local.get $char_code) (i32.const 0x0C)))
             (br_if $word_done (i32.lt_u (local.get $char_code) (i32.const 0x20)))
+            ;; Break at CHP boundary: if cp >= chp_end, stop
+            (br_if $word_done
+              (i32.ge_s (local.get $cp)
+                (i32.load (i32.add (local.get $chp_ptr) (i32.const 4)))
+              )
+            )
             (local.set $cp (i32.add (local.get $cp) (i32.const 1)))
             (br $word_loop)
           )
@@ -2053,9 +2476,7 @@
           )
         )
 
-        ;; Get CHP for this word
-        (local.set $chp_idx (call $find_chp_at_cp (local.get $word_start)))
-        (local.set $chp_ptr (i32.add (global.get $CHP_BASE) (i32.mul (local.get $chp_idx) (i32.const 28))))
+        ;; CHP already set during word boundary scan above
         (local.set $chp_flags (i32.load (i32.add (local.get $chp_ptr) (i32.const 8))))
         (local.set $chp_size (i32.load (i32.add (local.get $chp_ptr) (i32.const 12))))
         (local.set $chp_color (i32.load (i32.add (local.get $chp_ptr) (i32.const 16))))
@@ -2089,16 +2510,25 @@
         ;; Line break check: if word doesn't fit on current line
         (if (f32.gt
               (f32.add (local.get $cur_x) (local.get $word_width))
-              (f32.sub (global.get $PAGE_WIDTH_PX) (global.get $MARGIN_PX))
+              (f32.sub (global.get $PAGE_WIDTH_PX) (global.get $MARGIN_RIGHT_PX))
             )
           (then
+            ;; Align the finished line before wrapping
+            (call $align_line
+              (local.get $line_start_seg)
+              (global.get $layout_seg_count)
+              (local.get $para_align)
+              (local.get $cur_x)
+            )
+
             ;; Wrap to next line
             (local.set $cur_y (f32.add (local.get $cur_y) (local.get $line_height)))
-            (local.set $cur_x (global.get $MARGIN_PX))
+            (local.set $cur_x (global.get $MARGIN_LEFT_PX))
             (local.set $line_height (f32.const 16.0))
+            (local.set $line_start_seg (global.get $layout_seg_count))
 
             ;; Page break check
-            (if (f32.ge (local.get $cur_y) (f32.sub (global.get $PAGE_HEIGHT_PX) (global.get $MARGIN_PX)))
+            (if (f32.ge (local.get $cur_y) (f32.sub (global.get $PAGE_HEIGHT_PX) (global.get $MARGIN_BOTTOM_PX)))
               (then
                 (i32.store
                   (i32.add (global.get $LAYOUT_PAGE_TABLE) (i32.mul (local.get $page_num) (i32.const 8)))
@@ -2111,7 +2541,7 @@
                 (local.set $page_num (i32.add (local.get $page_num) (i32.const 1)))
                 (local.set $page_start_seg (global.get $layout_seg_count))
                 (local.set $seg_count_on_page (i32.const 0))
-                (local.set $cur_y (global.get $MARGIN_PX))
+                (local.set $cur_y (global.get $MARGIN_TOP_PX))
               )
             )
           )
