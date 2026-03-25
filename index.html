@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>doc.wasm — .doc viewer</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; background: #f0f0f0; padding: 20px; }
+    #drop-zone {
+      border: 3px dashed #999; border-radius: 12px; padding: 40px;
+      text-align: center; color: #666; cursor: pointer; margin-bottom: 20px;
+      transition: border-color 0.2s, background 0.2s;
+    }
+    #drop-zone.dragover { border-color: #333; background: #e0e0e0; }
+    #status { margin-bottom: 12px; font-size: 14px; color: #444; }
+    #doc-canvas {
+      background: white; box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+      display: block; margin: 0 auto;
+    }
+    #text-output {
+      margin-top: 20px; padding: 12px; background: white;
+      border: 1px solid #ddd; border-radius: 4px;
+      font-family: monospace; font-size: 13px; white-space: pre-wrap;
+      max-height: 300px; overflow: auto;
+    }
+  </style>
+</head>
+<body>
+  <div id="drop-zone">Drop a .doc file here (or click to browse)</div>
+  <div id="status">Loading wasm...</div>
+  <canvas id="doc-canvas" width="816" height="1056"></canvas>
+  <div id="text-output"></div>
+  <script type="module" src="js/browser.js"></script>
+</body>
+</html>
