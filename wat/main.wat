@@ -3248,7 +3248,9 @@
     (local $pap_dxaLeft i32)
     (local $pap_first_indent i32)
     (local $para_left_px f32)
-    (local $is_first_line i32)
+    (local $pap_space_before i32)
+    (local $pap_ilvl i32)
+    (local $effective_dxaLeft i32)
     (local $chp_run_start_istd i32)
     (local $chp_run_start_style_size i32)
     (local $cur_istd i32)
@@ -3277,8 +3279,24 @@
     (local.set $pap_dxaLeft (i32.load (i32.add (local.get $pap_ptr) (i32.const 28))))
     (local.set $pap_first_indent (i32.load (i32.add (local.get $pap_ptr) (i32.const 20))))
     (local.set $pap_ilfo (i32.load (i32.add (local.get $pap_ptr) (i32.const 36))))
-    (local.set $para_left_px (f32.add (global.get $MARGIN_LEFT_PX) (call $twips_to_px (local.get $pap_dxaLeft))))
-    (local.set $is_first_line (i32.const 1))
+    (local.set $pap_ilvl (i32.load (i32.add (local.get $pap_ptr) (i32.const 32))))
+    ;; Compute effective dxaLeft with ilvl indent for list paragraphs
+    (local.set $effective_dxaLeft (local.get $pap_dxaLeft))
+    (if (local.get $pap_ilfo)
+      (then
+        (local.set $effective_dxaLeft
+          (i32.add (local.get $effective_dxaLeft)
+            (i32.mul (local.get $pap_ilvl) (i32.const 360))))
+      )
+    )
+    (local.set $para_left_px (f32.add (global.get $MARGIN_LEFT_PX) (call $twips_to_px (local.get $effective_dxaLeft))))
+    ;; Apply space_before for first paragraph
+    (local.set $pap_space_before (i32.load (i32.add (local.get $pap_ptr) (i32.const 12))))
+    (if (local.get $pap_space_before)
+      (then
+        (local.set $cur_y (f32.add (local.get $cur_y) (call $twips_to_px (local.get $pap_space_before))))
+      )
+    )
     (local.set $cur_x (local.get $para_left_px))
     ;; Apply first-line indent
     (if (local.get $pap_first_indent)
@@ -3382,8 +3400,24 @@
             (local.set $pap_dxaLeft (i32.load (i32.add (local.get $pap_ptr) (i32.const 28))))
             (local.set $pap_first_indent (i32.load (i32.add (local.get $pap_ptr) (i32.const 20))))
             (local.set $pap_ilfo (i32.load (i32.add (local.get $pap_ptr) (i32.const 36))))
-            (local.set $para_left_px (f32.add (global.get $MARGIN_LEFT_PX) (call $twips_to_px (local.get $pap_dxaLeft))))
-            (local.set $is_first_line (i32.const 1))
+            (local.set $pap_ilvl (i32.load (i32.add (local.get $pap_ptr) (i32.const 32))))
+            ;; Compute effective dxaLeft with ilvl indent for list paragraphs
+            (local.set $effective_dxaLeft (local.get $pap_dxaLeft))
+            (if (local.get $pap_ilfo)
+              (then
+                (local.set $effective_dxaLeft
+                  (i32.add (local.get $effective_dxaLeft)
+                    (i32.mul (local.get $pap_ilvl) (i32.const 360))))
+              )
+            )
+            (local.set $para_left_px (f32.add (global.get $MARGIN_LEFT_PX) (call $twips_to_px (local.get $effective_dxaLeft))))
+            ;; Apply space_before for next paragraph
+            (local.set $pap_space_before (i32.load (i32.add (local.get $pap_ptr) (i32.const 12))))
+            (if (local.get $pap_space_before)
+              (then
+                (local.set $cur_y (f32.add (local.get $cur_y) (call $twips_to_px (local.get $pap_space_before))))
+              )
+            )
             (local.set $cur_x (local.get $para_left_px))
             ;; Apply first-line indent
             (if (local.get $pap_first_indent)
@@ -3550,8 +3584,24 @@
             (local.set $pap_dxaLeft (i32.load (i32.add (local.get $pap_ptr) (i32.const 28))))
             (local.set $pap_first_indent (i32.load (i32.add (local.get $pap_ptr) (i32.const 20))))
             (local.set $pap_ilfo (i32.load (i32.add (local.get $pap_ptr) (i32.const 36))))
-            (local.set $para_left_px (f32.add (global.get $MARGIN_LEFT_PX) (call $twips_to_px (local.get $pap_dxaLeft))))
-            (local.set $is_first_line (i32.const 1))
+            (local.set $pap_ilvl (i32.load (i32.add (local.get $pap_ptr) (i32.const 32))))
+            ;; Compute effective dxaLeft with ilvl indent for list paragraphs
+            (local.set $effective_dxaLeft (local.get $pap_dxaLeft))
+            (if (local.get $pap_ilfo)
+              (then
+                (local.set $effective_dxaLeft
+                  (i32.add (local.get $effective_dxaLeft)
+                    (i32.mul (local.get $pap_ilvl) (i32.const 360))))
+              )
+            )
+            (local.set $para_left_px (f32.add (global.get $MARGIN_LEFT_PX) (call $twips_to_px (local.get $effective_dxaLeft))))
+            ;; Apply space_before for next paragraph
+            (local.set $pap_space_before (i32.load (i32.add (local.get $pap_ptr) (i32.const 12))))
+            (if (local.get $pap_space_before)
+              (then
+                (local.set $cur_y (f32.add (local.get $cur_y) (call $twips_to_px (local.get $pap_space_before))))
+              )
+            )
             (local.set $cur_x (local.get $para_left_px))
             (if (local.get $pap_first_indent)
               (then
@@ -3741,7 +3791,6 @@
             ;; Wrap to next line
             (local.set $cur_y (f32.add (local.get $cur_y) (local.get $line_height)))
             (local.set $cur_x (local.get $para_left_px))
-            (local.set $is_first_line (i32.const 0))
             (local.set $line_height (f32.const 16.0))
             (local.set $line_start_seg (global.get $layout_seg_count))
 
