@@ -64,7 +64,7 @@ function getCHPRun(view, index) {
 
 function getPAPRun(view, index) {
   const PAP_BASE = 0x00194000;
-  const ptr = PAP_BASE + index * 40;
+  const ptr = PAP_BASE + index * 56;
   return {
     cpStart: view.getInt32(ptr, true),
     cpEnd: view.getInt32(ptr + 4, true),
@@ -76,6 +76,10 @@ function getPAPRun(view, index) {
     dxaLeft: view.getInt32(ptr + 28, true),
     ilvl: view.getUint32(ptr + 32, true),
     ilfo: view.getUint32(ptr + 36, true),
+    dyaLine: view.getInt32(ptr + 40, true),
+    fMultLinespace: view.getUint32(ptr + 44, true),
+    fInTable: view.getUint32(ptr + 48, true),
+    fTtp: view.getUint32(ptr + 52, true),
   };
 }
 
@@ -399,6 +403,29 @@ async function testFontSizeBleed() {
     `most common=${mostCommonSize}(${sizeHist[mostCommonSize]}), smallest=${smallestSize}(${sizeHist[smallestSize]})`);
 }
 await testFontSizeBleed();
+
+// ── poi-test.doc — line spacing parsed ──
+async function testLineSpacing() {
+  const { err, view, instance } = await loadAndParse('poi-test.doc');
+  console.log('\npoi-test.doc — line spacing');
+  assert('parse succeeds', err === 0);
+
+  const papCount = instance.exports.get_pap_run_count();
+  let dyaLineCount = 0;
+  for (let i = 0; i < papCount; i++) {
+    const run = getPAPRun(view, i);
+    if (run.dyaLine !== 0) dyaLineCount++;
+  }
+  assert('has PAP runs with non-zero dyaLine', dyaLineCount > 0, `found ${dyaLineCount}`);
+  assert('line spacing is proportional (fMultLinespace=1)', (() => {
+    for (let i = 0; i < papCount; i++) {
+      const run = getPAPRun(view, i);
+      if (run.dyaLine !== 0 && run.fMultLinespace === 1) return true;
+    }
+    return false;
+  })());
+}
+await testLineSpacing();
 
 console.log(`\n===================`);
 console.log(`Results: ${passed} passed, ${failed} failed`);

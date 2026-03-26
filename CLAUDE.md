@@ -43,11 +43,11 @@ Single WAT file (`wat/main.wat`) containing all parsing and layout logic:
 
 Fixed regions at known offsets (see top of `wat/main.wat`):
 - `0x00094000` — CHP runs (28-byte records)
-- `0x00194000` — PAP runs (40-byte records)
+- `0x00194000` — PAP runs (56-byte records)
 - `0x002A4000` — Style table (28-byte records per istd)
 - `0x002B4000` — Layout segments (28-byte records)
 
-### PAP run format (40 bytes)
+### PAP run format (56 bytes)
 
 | Offset | Field | Description |
 |--------|-------|-------------|
@@ -61,6 +61,10 @@ Fixed regions at known offsets (see top of `wat/main.wat`):
 | 28 | dxaLeft | Left indent (twips, signed) |
 | 32 | ilvl | List indent level |
 | 36 | ilfo | List format override index (>0 = list paragraph) |
+| 40 | dyaLine | Line spacing value (twips or 240ths) |
+| 44 | fMultLinespace | 0=absolute twips, 1=proportional (240=single) |
+| 48 | fInTable | 1 if paragraph is in a table |
+| 52 | fTtp | 1 if paragraph is table row end mark |
 
 ### Style table format (28 bytes per entry)
 
@@ -81,3 +85,5 @@ Fixed regions at known offsets (see top of `wat/main.wat`):
 - **Style-level PAP properties**: Paragraph styles' papx UPX is parsed for alignment and dxaLeft, which serve as defaults before direct formatting overrides.
 - **List bullet synthesis**: List paragraphs (ilfo > 0) get a bullet character (U+2022 "•") prepended during layout. Parsed from `sprmPIlvl` (0x260A) and `sprmPIlfo` (0x460B).
 - **sprm_size overrides**: Some sprms (0x845E, 0x8460) have misleading spra bits suggesting variable-length, but are actually fixed 2-byte operands. These are special-cased in `$sprm_size`.
+- **Line spacing**: Parsed from `sprmPDyaLine` (0x6412), a 4-byte LSPD structure (dyaLine + fMultLinespace). When fMultLinespace=1, dyaLine is in 240ths of a line (240=single, 480=double). When fMultLinespace=0, dyaLine is absolute twips.
+- **Table layout**: Table paragraphs detected via `sprmPFInTable` (0x2416) and `sprmPFTtp` (0x2417). Cells in a row are laid out side-by-side with equal-width columns (content width / cell count). Column count is determined by scanning ahead for 0x07 marks until the row-end (fTtp) paragraph.
