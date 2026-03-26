@@ -58,6 +58,23 @@ export async function createDocParser(canvas) {
           ctx.font = currentFont;
         }
       },
+      drawImage(ptr, len, x, y, w, h) {
+        if (!ctx) return;
+        try {
+          const imgData = new Uint8Array(memory.buffer, ptr, len);
+          const blob = new Blob([imgData]);
+          const url = URL.createObjectURL(blob);
+          const img = new Image();
+          img.onload = () => {
+            ctx.drawImage(img, x, y, w, h);
+            URL.revokeObjectURL(url);
+          };
+          img.src = url;
+        } catch {
+          ctx.strokeStyle = '#cccccc';
+          ctx.strokeRect(x, y, w, h);
+        }
+      },
     },
     env: {
       log(val) {

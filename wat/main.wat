@@ -12,6 +12,7 @@
   (import "canvas" "fillText"    (func $fillText (param $ptr i32) (param $len i32) (param $x f32) (param $y f32)))
   (import "canvas" "fillRect"    (func $fillRect (param $x f32) (param $y f32) (param $w f32) (param $h f32)))
   (import "canvas" "setPage"     (func $setPage (param $pageNum i32) (param $widthPx f32) (param $heightPx f32)))
+  (import "canvas" "drawImage"   (func $drawImage (param $ptr i32) (param $len i32) (param $x f32) (param $y f32) (param $w f32) (param $h f32)))
   (import "env"    "log"         (func $log (param i32)))
 
   ;; ── Memory ──────────────────────────────────────────────────
@@ -1189,7 +1190,10 @@
     ;; Phase 11: Parse SEP (section properties — page size, margins)
     (call $parse_sep)
 
-    ;; Phase 12: Layout
+    ;; Phase 12: Scan for embedded images in Data stream
+    (call $scan_images)
+
+    ;; Phase 13: Layout
     (call $do_layout)
 
     (global.set $error_code (global.get $ERR_NONE))
@@ -2054,6 +2058,245 @@
     (global.set $MARGIN_PX (global.get $MARGIN_LEFT_PX))
   )
 
+  ;; ── Image Table ──────────────────────────────────────────────
+  ;; Scan Data stream for PICF entries containing BLIP image data.
+  ;; Image table stored at SEP_BASE (reusing the 64KB SEP region):
+  ;; Each entry: 16 bytes = data_ptr(u32), data_len(u32), width_px(f32), height_px(f32)
+  ;; Max 256 images
+
+  (global $IMG_TABLE i32 (i32.const 0x00294000))  ;; reuse SEP_BASE
+  (global $img_count (mut i32) (i32.const 0))
+  (global $img_cursor (mut i32) (i32.const 0))  ;; next image to render (for 0x01 chars)
+
+  (func $scan_images
+    (local $off i32)
+    (local $lcb i32)
+    (local $cb_header i32)
+    (local $search_pos i32)
+    (local $search_end i32)
+    (local $rec_type i32)
+    (local $rec_len i32)
+    (local $blip_data_ptr i32)
+    (local $blip_data_len i32)
+    (local $img_w_px f32)
+    (local $img_h_px f32)
+    (local $entry_ptr i32)
+    (local $png_w i32)
+    (local $png_h i32)
+
+    ;; No Data stream = no images
+    (if (i32.eqz (global.get $data_len)) (then (return)))
+
+    (global.set $img_count (i32.const 0))
+    (local.set $off (i32.const 0))
+
+    (block $done
+      (loop $loop
+        ;; Need at least 6 bytes for lcb + cbHeader
+        (br_if $done (i32.ge_u (i32.add (local.get $off) (i32.const 6)) (global.get $data_len)))
+        ;; Max 256 images
+        (br_if $done (i32.ge_u (global.get $img_count) (i32.const 256)))
+
+        (local.set $lcb (call $read_u32_le (i32.add (global.get $data_ptr) (local.get $off))))
+        ;; lcb includes itself — valid range check
+        (br_if $done (i32.lt_u (local.get $lcb) (i32.const 70)))
+        (br_if $done (i32.gt_u (local.get $lcb) (global.get $data_len)))
+
+        (local.set $cb_header (call $read_u16_le (i32.add (global.get $data_ptr) (i32.add (local.get $off) (i32.const 4)))))
+
+        ;; Validate cbHeader = 0x44 (standard PICF)
+        (if (i32.ne (local.get $cb_header) (i32.const 0x44))
+          (then
+            ;; Try skipping forward to find next PICF
+            (local.set $off (i32.add (local.get $off) (local.get $lcb)))
+            (br $loop)
+          )
+        )
+
+        ;; Search for BLIP record (0xF01A-0xF01F) in SpContainer area
+        (local.set $search_pos (i32.add (local.get $off) (local.get $cb_header)))
+        (local.set $search_end (i32.add (local.get $off) (local.get $lcb)))
+        (if (i32.gt_u (local.get $search_end) (global.get $data_len))
+          (then (local.set $search_end (global.get $data_len)))
+        )
+
+        (local.set $blip_data_ptr (i32.const 0))
+        (local.set $blip_data_len (i32.const 0))
+
+        (block $blip_found
+          (loop $search_loop
+            (br_if $blip_found
+              (i32.ge_u (i32.add (local.get $search_pos) (i32.const 8))
+                (local.get $search_end)
+              )
+            )
+
+            (local.set $rec_type
+              (call $read_u16_le
+                (i32.add (global.get $data_ptr)
+                  (i32.add (local.get $search_pos) (i32.const 2))
+                )
+              )
+            )
+
+            ;; Check for BLIP types: 0xF01A-0xF01F
+            (if (i32.and
+                  (i32.ge_u (local.get $rec_type) (i32.const 0xF01A))
+                  (i32.le_u (local.get $rec_type) (i32.const 0xF01F))
+                )
+              (then
+                (local.set $rec_len
+                  (call $read_u32_le
+                    (i32.add (global.get $data_ptr)
+                      (i32.add (local.get $search_pos) (i32.const 4))
+                    )
+                  )
+                )
+
+                ;; PNG (0xF01E) or JPEG (0xF01D): 8 header + 16 UID + 1 tag = 25 bytes before image
+                (if (i32.or
+                      (i32.eq (local.get $rec_type) (i32.const 0xF01E))
+                      (i32.eq (local.get $rec_type) (i32.const 0xF01D))
+                    )
+                  (then
+                    (local.set $blip_data_ptr
+                      (i32.add (global.get $data_ptr)
+                        (i32.add (local.get $search_pos) (i32.const 25))
+                      )
+                    )
+                    (local.set $blip_data_len (i32.sub (local.get $rec_len) (i32.const 17)))
+                  )
+                )
+
+                ;; For EMF/WMF (0xF01A/0xF01B): 8 + 16 UID + 34 metafile header = 58
+                (if (i32.or
+                      (i32.eq (local.get $rec_type) (i32.const 0xF01A))
+                      (i32.eq (local.get $rec_type) (i32.const 0xF01B))
+                    )
+                  (then
+                    (local.set $blip_data_ptr
+                      (i32.add (global.get $data_ptr)
+                        (i32.add (local.get $search_pos) (i32.const 58))
+                      )
+                    )
+                    (local.set $blip_data_len (i32.sub (local.get $rec_len) (i32.const 50)))
+                  )
+                )
+
+                (br $blip_found)
+              )
+            )
+
+            (local.set $search_pos (i32.add (local.get $search_pos) (i32.const 1)))
+            (br $search_loop)
+          )
+        )
+
+        ;; If we found a BLIP, get dimensions and store in image table
+        (if (i32.gt_u (local.get $blip_data_len) (i32.const 0))
+          (then
+            ;; Get image dimensions: for PNG, IHDR at offset 16 (width BE u32), 20 (height BE u32)
+            ;; For JPEG, we'll pass 0x0 and let JS figure it out
+            (local.set $img_w_px (f32.const 200.0))  ;; default
+            (local.set $img_h_px (f32.const 150.0))
+
+            ;; Check PNG signature (89 50 4E 47)
+            (if (i32.and
+                  (i32.eq (call $read_u8 (local.get $blip_data_ptr)) (i32.const 0x89))
+                  (i32.eq (call $read_u8 (i32.add (local.get $blip_data_ptr) (i32.const 1))) (i32.const 0x50))
+                )
+              (then
+                ;; PNG IHDR: width at +16 (big-endian u32), height at +20
+                (local.set $png_w
+                  (i32.or
+                    (i32.or
+                      (i32.shl (call $read_u8 (i32.add (local.get $blip_data_ptr) (i32.const 16))) (i32.const 24))
+                      (i32.shl (call $read_u8 (i32.add (local.get $blip_data_ptr) (i32.const 17))) (i32.const 16))
+                    )
+                    (i32.or
+                      (i32.shl (call $read_u8 (i32.add (local.get $blip_data_ptr) (i32.const 18))) (i32.const 8))
+                      (call $read_u8 (i32.add (local.get $blip_data_ptr) (i32.const 19)))
+                    )
+                  )
+                )
+                (local.set $png_h
+                  (i32.or
+                    (i32.or
+                      (i32.shl (call $read_u8 (i32.add (local.get $blip_data_ptr) (i32.const 20))) (i32.const 24))
+                      (i32.shl (call $read_u8 (i32.add (local.get $blip_data_ptr) (i32.const 21))) (i32.const 16))
+                    )
+                    (i32.or
+                      (i32.shl (call $read_u8 (i32.add (local.get $blip_data_ptr) (i32.const 22))) (i32.const 8))
+                      (call $read_u8 (i32.add (local.get $blip_data_ptr) (i32.const 23)))
+                    )
+                  )
+                )
+                ;; Scale to fit content width (max ~624 px for standard margins)
+                (local.set $img_w_px (f32.convert_i32_u (local.get $png_w)))
+                (local.set $img_h_px (f32.convert_i32_u (local.get $png_h)))
+                ;; Cap width to content area
+                (if (f32.gt (local.get $img_w_px)
+                      (f32.sub (global.get $PAGE_WIDTH_PX)
+                        (f32.add (global.get $MARGIN_LEFT_PX) (global.get $MARGIN_RIGHT_PX))
+                      )
+                    )
+                  (then
+                    (local.set $img_h_px
+                      (f32.mul (local.get $img_h_px)
+                        (f32.div
+                          (f32.sub (global.get $PAGE_WIDTH_PX)
+                            (f32.add (global.get $MARGIN_LEFT_PX) (global.get $MARGIN_RIGHT_PX))
+                          )
+                          (local.get $img_w_px)
+                        )
+                      )
+                    )
+                    (local.set $img_w_px
+                      (f32.sub (global.get $PAGE_WIDTH_PX)
+                        (f32.add (global.get $MARGIN_LEFT_PX) (global.get $MARGIN_RIGHT_PX))
+                      )
+                    )
+                  )
+                )
+              )
+            )
+
+            ;; Write image table entry
+            (local.set $entry_ptr
+              (i32.add (global.get $IMG_TABLE) (i32.mul (global.get $img_count) (i32.const 16)))
+            )
+            (i32.store (local.get $entry_ptr) (local.get $blip_data_ptr))
+            (i32.store (i32.add (local.get $entry_ptr) (i32.const 4)) (local.get $blip_data_len))
+            (f32.store (i32.add (local.get $entry_ptr) (i32.const 8)) (local.get $img_w_px))
+            (f32.store (i32.add (local.get $entry_ptr) (i32.const 12)) (local.get $img_h_px))
+
+            (global.set $img_count (i32.add (global.get $img_count) (i32.const 1)))
+          )
+        )
+
+        ;; Next PICF: try off + lcb, but also scan forward for cbHeader=0x44
+        (local.set $off (i32.add (local.get $off) (local.get $lcb)))
+
+        ;; Scan for next valid PICF (cbHeader=0x44 with SpContainer)
+        (block $found_next
+          (loop $scan
+            (br_if $done (i32.ge_u (i32.add (local.get $off) (i32.const 70)) (global.get $data_len)))
+            (if (i32.eq
+                  (call $read_u16_le (i32.add (global.get $data_ptr) (i32.add (local.get $off) (i32.const 4))))
+                  (i32.const 0x44)
+                )
+              (then (br $found_next))
+            )
+            (local.set $off (i32.add (local.get $off) (i32.const 2)))
+            (br $scan)
+          )
+        )
+
+        (br $loop)
+      )
+    )
+  )
+
   ;; ── Layout Engine ───────────────────────────────────────────
   ;; Builds layout data at LAYOUT_BASE.
   ;; Uses $measureText import for line breaking.
@@ -2418,8 +2661,83 @@
           )
         )
 
+        ;; Handle embedded object (0x01) — inline image
+        (if (i32.and
+              (i32.eq (local.get $char_code) (i32.const 0x01))
+              (i32.lt_u (global.get $img_cursor) (global.get $img_count))
+            )
+          (then
+            ;; Write image segment: use negative text_len as signal to renderer
+            ;; flags_and_size encodes image index in high 16 bits, 0xFFFF in low 16 as marker
+            (call $write_layout_seg
+              (global.get $layout_seg_count)
+              ;; text_ptr = image data ptr (from image table)
+              (i32.load (i32.add (global.get $IMG_TABLE) (i32.mul (global.get $img_cursor) (i32.const 16))))
+              ;; text_len = image data len
+              (i32.load (i32.add (i32.add (global.get $IMG_TABLE) (i32.mul (global.get $img_cursor) (i32.const 16))) (i32.const 4)))
+              ;; x = cur_x
+              (local.get $cur_x)
+              ;; y = cur_y
+              (local.get $cur_y)
+              ;; flags: 0xFFFF marker in low 16, img_cursor in high 16
+              (i32.or (i32.const 0xFFFF) (i32.shl (global.get $img_cursor) (i32.const 16)))
+              ;; color = packed width(u16)|height(u16) in pixels (capped to u16)
+              (i32.or
+                (i32.and
+                  (i32.trunc_f32_u (f32.load (i32.add (i32.add (global.get $IMG_TABLE) (i32.mul (global.get $img_cursor) (i32.const 16))) (i32.const 8))))
+                  (i32.const 0xFFFF)
+                )
+                (i32.shl
+                  (i32.and
+                    (i32.trunc_f32_u (f32.load (i32.add (i32.add (global.get $IMG_TABLE) (i32.mul (global.get $img_cursor) (i32.const 16))) (i32.const 12))))
+                    (i32.const 0xFFFF)
+                  )
+                  (i32.const 16)
+                )
+              )
+            )
+            (global.set $layout_seg_count (i32.add (global.get $layout_seg_count) (i32.const 1)))
+            (local.set $seg_count_on_page (i32.add (local.get $seg_count_on_page) (i32.const 1)))
+
+            ;; Advance y by image height + small gap
+            (local.set $cur_y
+              (f32.add (local.get $cur_y)
+                (f32.add
+                  (f32.load (i32.add (i32.add (global.get $IMG_TABLE) (i32.mul (global.get $img_cursor) (i32.const 16))) (i32.const 12)))
+                  (f32.const 4.0)
+                )
+              )
+            )
+            (local.set $cur_x (global.get $MARGIN_LEFT_PX))
+            (local.set $line_start_seg (global.get $layout_seg_count))
+
+            ;; Page break check after image
+            (if (f32.ge (local.get $cur_y) (f32.sub (global.get $PAGE_HEIGHT_PX) (global.get $MARGIN_BOTTOM_PX)))
+              (then
+                (i32.store
+                  (i32.add (global.get $LAYOUT_PAGE_TABLE) (i32.mul (local.get $page_num) (i32.const 8)))
+                  (local.get $page_start_seg)
+                )
+                (i32.store
+                  (i32.add (global.get $LAYOUT_PAGE_TABLE) (i32.add (i32.mul (local.get $page_num) (i32.const 8)) (i32.const 4)))
+                  (local.get $seg_count_on_page)
+                )
+                (local.set $page_num (i32.add (local.get $page_num) (i32.const 1)))
+                (local.set $page_start_seg (global.get $layout_seg_count))
+                (local.set $seg_count_on_page (i32.const 0))
+                (local.set $cur_y (global.get $MARGIN_TOP_PX))
+                (local.set $cur_x (global.get $MARGIN_LEFT_PX))
+              )
+            )
+
+            (global.set $img_cursor (i32.add (global.get $img_cursor) (i32.const 1)))
+            (local.set $cp (i32.add (local.get $cp) (i32.const 1)))
+            (br $cp_loop)
+          )
+        )
+
         ;; Skip control characters and special Word markers
-        ;; 0x01=embedded obj, 0x07=cell mark, 0x08=drawn obj, 0x0A=LF, etc.
+        ;; 0x01=embedded obj (no image), 0x07=cell mark, 0x08=drawn obj, 0x0A=LF, etc.
         (if (i32.lt_u (local.get $char_code) (i32.const 0x20))
           (then
             ;; Tab (0x09): advance x by ~4 spaces worth
@@ -2660,6 +2978,24 @@
         (local.set $flags (i32.and (local.get $flags_and_size) (i32.const 0xFFFF)))
         (local.set $font_size (i32.shr_u (local.get $flags_and_size) (i32.const 16)))
 
+        ;; Check if this is an image segment (flags low 16 = 0xFFFF)
+        (if (i32.eq (local.get $flags) (i32.const 0xFFFF))
+          (then
+            ;; Image: text_ptr=image data, text_len=image data len
+            ;; color = width(low16) | height(high16) packed
+            (call $drawImage
+              (local.get $text_ptr_val)
+              (local.get $text_len_val)
+              (local.get $x)
+              (local.get $y)
+              (f32.convert_i32_u (i32.and (local.get $color) (i32.const 0xFFFF)))
+              (f32.convert_i32_u (i32.shr_u (local.get $color) (i32.const 16)))
+            )
+            (local.set $i (i32.add (local.get $i) (i32.const 1)))
+            (br $loop)
+          )
+        )
+
         ;; Set font and color
         (call $setFont (local.get $font_size)
           (i32.and (local.get $flags) (i32.const 1))
@@ -2719,6 +3055,14 @@
   (func $set_input (param $ptr i32) (param $len i32)
     (global.set $input_ptr (local.get $ptr))
     (global.set $input_len (local.get $len))
+    ;; Set arena to start AFTER the input (page-aligned)
+    (global.set $arena_base
+      (i32.and
+        (i32.add (i32.add (local.get $ptr) (local.get $len)) (i32.const 0xFFFF))
+        (i32.const 0xFFFF0000)
+      )
+    )
+    (global.set $arena_ptr (global.get $arena_base))
   )
 
   (func $get_text_ptr (result i32) (global.get $text_ptr))

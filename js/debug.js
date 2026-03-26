@@ -28,7 +28,7 @@ const imports = {
       currentFont = `${italic?'italic ':''}${bold?'bold ':''}${pt}pt serif`;
       if (ctx) ctx.font = currentFont;
     },
-    setColor() {}, fillText() {}, fillRect() {}, setPage() {},
+    setColor() {}, fillText() {}, fillRect() {}, setPage() {}, drawImage() {},
   },
   env: { log(v) { console.error('[wasm]', v); } },
 };

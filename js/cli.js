@@ -95,11 +95,19 @@ const imports = {
       ctx.fillStyle = '#000000';
       ctx.font = currentFont;
     },
+    drawImage(ptr, len, x, y, w, h) {
+      if (!ctx || !canvas) return;
+      // Queue image for async loading after render
+      const imgBuf = Buffer.from(new Uint8Array(memory.buffer, ptr, len));
+      pendingImages.push({ imgBuf, x, y, w, h, canvas, ctx });
+    },
   },
   env: {
     log(val) { console.error('[wasm]', val); },
   },
 };
+
+const pendingImages = [];
 
 const { instance } = await WebAssembly.instantiate(wasmBytes, imports);
 const memory = instance.exports.memory;
@@ -147,18 +155,35 @@ if (renderPath && createCanvas) {
   const pageCount = instance.exports.get_page_count();
   console.error(`Rendering ${pageCount} page(s)`);
 
+  const { loadImage } = await import('canvas');
+
+  async function renderPage(p) {
+    pendingImages.length = 0;
+    instance.exports.render(p);
+    // Process pending images
+    for (const img of pendingImages) {
+      try {
+        const loaded = await loadImage(img.imgBuf);
+        img.ctx.drawImage(loaded, img.x, img.y, img.w, img.h);
+      } catch (e) {
+        img.ctx.strokeStyle = '#cccccc';
+        img.ctx.strokeRect(img.x, img.y, img.w, img.h);
+        img.ctx.fillStyle = '#000000';
+      }
+    }
+  }
+
   if (pageCount === 1) {
-    instance.exports.render(0);
+    await renderPage(0);
     if (canvas) {
       const pngBuffer = canvas.toBuffer('image/png');
       writeFileSync(renderPath, pngBuffer);
       console.error(`Wrote ${renderPath} (${pngBuffer.length} bytes)`);
     }
   } else {
-    // Multi-page: output as name-0.png, name-1.png, ...
     const base = renderPath.replace(/\.png$/i, '');
     for (let p = 0; p < pageCount; p++) {
-      instance.exports.render(p);
+      await renderPage(p);
       if (canvas) {
         const outPath = `${base}-${p}.png`;
         const pngBuffer = canvas.toBuffer('image/png');
