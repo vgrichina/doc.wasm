@@ -1181,6 +1181,9 @@
       (return (local.get $err))
     ))
 
+    ;; Phase 8.5: Parse STSH (stylesheet — style defaults)
+    (call $parse_stsh)
+
     ;; Phase 9: Parse CHP (character properties)
     (call $parse_chp)
 
@@ -1201,6 +1204,165 @@
   )
 
   ;; ── CHP (Character Properties) Parser ───────────────────────
+
+  ;; Style defaults from STSH (Normal style)
+  (global $style_default_font_size (mut i32) (i32.const 24))  ;; default 12pt
+  (global $style_default_flags     (mut i32) (i32.const 0))
+
+  ;; ── STSH (Stylesheet) Parser ──────────────────────────────────
+  ;; Parse the Normal style (sti=0) from the STSH to extract default formatting
+
+  (func $parse_stsh
+    (local $fc i32)
+    (local $lcb i32)
+    (local $stsh_ptr i32)
+    (local $cbStshi i32)
+    (local $pos i32)
+    (local $end i32)
+    (local $std_base i32)
+    (local $cbStd i32)
+    (local $sti_val i32)
+    (local $sgc i32)
+    (local $cupx i32)
+    (local $upx_ptr i32)
+    (local $cbUpx i32)
+    (local $flags i32)
+    (local $font_size i32)
+    (local $color i32)
+
+    ;; Read fcStshf / lcbStshf from FIB_BASE offsets 32/36
+    (local.set $fc (i32.load (i32.add (global.get $FIB_BASE) (i32.const 32))))
+    (local.set $lcb (i32.load (i32.add (global.get $FIB_BASE) (i32.const 36))))
+
+    ;; Bail if no STSH data
+    (if (i32.eqz (local.get $lcb)) (then (return)))
+
+    (local.set $stsh_ptr (i32.add (global.get $table_ptr) (local.get $fc)))
+    (local.set $end (i32.add (local.get $stsh_ptr) (local.get $lcb)))
+
+    ;; Read cbStshi (2 bytes) — size of the STSH header
+    (local.set $cbStshi (call $read_u16_le (local.get $stsh_ptr)))
+
+    ;; Skip past STSH header: 2 bytes for cbStshi + cbStshi bytes of header data
+    (local.set $pos (i32.add (local.get $stsh_ptr) (i32.add (i32.const 2) (local.get $cbStshi))))
+
+    ;; Now we're at the array of STD entries
+    ;; First STD is the Normal style (index 0, sti=0)
+    ;; STD format: 2-byte cbStd (total size of this STD, excluding these 2 bytes)
+    ;; If cbStd == 0, empty slot — skip it
+
+    ;; We only need the first entry (Normal style)
+    (if (i32.ge_u (i32.add (local.get $pos) (i32.const 2)) (local.get $end))
+      (then (return))
+    )
+
+    (local.set $cbStd (call $read_u16_le (local.get $pos)))
+    (local.set $pos (i32.add (local.get $pos) (i32.const 2)))
+
+    ;; Empty slot
+    (if (i32.eqz (local.get $cbStd)) (then (return)))
+
+    (local.set $std_base (local.get $pos))
+
+    ;; StdfBase (fixed part): first 2 bytes contain packed fields
+    ;; bits 0-11: sti (style type index)
+    ;; bits 12-15: sgc (style group code, 1=paragraph, 2=character)
+    (local.set $sti_val (i32.and (call $read_u16_le (local.get $pos)) (i32.const 0x0FFF)))
+    (local.set $sgc (i32.and (i32.shr_u (call $read_u16_le (local.get $pos)) (i32.const 12)) (i32.const 0x0F)))
+
+    ;; Verify this is sti=0 (Normal)
+    (if (local.get $sti_val) (then (return)))
+
+    ;; StdfBase is 10 bytes (the fixed part we care about)
+    ;; After StdfBase: optional StdfPost2000 data, then the style name, then UPX groups
+    ;; cupx = number of UPX groups — for paragraph style, cupx=2 (papx UPX + chpx UPX)
+    ;; cupx is at offset 2 (bytes 2-3 of StdfBase), bits 0-3 of the second u16
+    (local.set $cupx (i32.and (call $read_u16_le (i32.add (local.get $pos) (i32.const 2))) (i32.const 0x000F)))
+
+    ;; Skip to the UPX data. StdfBase = 10 bytes minimum.
+    ;; After that comes StdfPost2000 (variable) and the style name.
+    ;; Rather than parse all that precisely, scan forward for the grpprl.
+    ;; A simpler approach: the grpprl is at the end of the STD.
+    ;; For Normal paragraph style: there are 2 UPXs — papx first, then chpx.
+    ;; Each UPX starts with 2-byte cbUpx (size), then cbUpx bytes of data, then padding to even.
+
+    ;; We need to find the UPX region. The STD has:
+    ;; - StdfBase (10 bytes)
+    ;; - 2 bytes: stk/istdBase stuff (already counted in StdfBase)
+    ;; - style name: 2 bytes xstzName length + name chars + padding
+    ;; Let's just jump to offset 10 in StdfBase and handle the name
+
+    (local.set $pos (i32.add (local.get $std_base) (i32.const 10)))
+
+    ;; Read xstzName: first 2 bytes = length of name in characters (not bytes)
+    ;; Skip name + null terminator
+    (if (i32.lt_u (i32.add (local.get $pos) (i32.const 2)) (local.get $end))
+      (then
+        (local.set $pos (i32.add (local.get $pos)
+          (i32.add (i32.const 2)
+            (i32.mul (i32.add (call $read_u16_le (local.get $pos)) (i32.const 1)) (i32.const 2))
+          )
+        ))
+        ;; Pad to even offset relative to std_base
+        (if (i32.and (i32.sub (local.get $pos) (local.get $std_base)) (i32.const 1))
+          (then (local.set $pos (i32.add (local.get $pos) (i32.const 1))))
+        )
+      )
+    )
+
+    ;; Now at UPX array. For paragraph style (sgc=1), first UPX is papx, second is chpx.
+    ;; For character style (sgc=2), first UPX is chpx.
+    ;; We want the chpx UPX.
+
+    (if (i32.eq (local.get $sgc) (i32.const 1))
+      (then
+        ;; Skip papx UPX: 2-byte cbUpx + cbUpx bytes + padding
+        (if (i32.lt_u (i32.add (local.get $pos) (i32.const 2)) (local.get $end))
+          (then
+            (local.set $cbUpx (call $read_u16_le (local.get $pos)))
+            (local.set $pos (i32.add (local.get $pos) (i32.add (i32.const 2) (local.get $cbUpx))))
+            ;; Pad to even
+            (if (i32.and (i32.sub (local.get $pos) (local.get $std_base)) (i32.const 1))
+              (then (local.set $pos (i32.add (local.get $pos) (i32.const 1))))
+            )
+          )
+        )
+      )
+    )
+
+    ;; Now at chpx UPX
+    (if (i32.ge_u (i32.add (local.get $pos) (i32.const 2)) (local.get $end))
+      (then (return))
+    )
+
+    (local.set $cbUpx (call $read_u16_le (local.get $pos)))
+    (local.set $pos (i32.add (local.get $pos) (i32.const 2)))
+
+    (if (i32.eqz (local.get $cbUpx)) (then (return)))
+    (if (i32.gt_u (i32.add (local.get $pos) (local.get $cbUpx)) (local.get $end))
+      (then (return))
+    )
+
+    ;; Parse the chpx grpprl for font size, bold, etc.
+    (local.set $flags (i32.const 0))
+    (local.set $font_size (i32.const 24))
+    (local.set $color (i32.const 0))
+
+    (call $parse_chp_sprms
+      (local.get $pos)
+      (local.get $cbUpx)
+      (local.get $flags)
+      (local.get $font_size)
+      (local.get $color)
+    )
+    (local.set $color)
+    (local.set $font_size)
+    (local.set $flags)
+
+    ;; Store as style defaults
+    (global.set $style_default_font_size (local.get $font_size))
+    (global.set $style_default_flags (local.get $flags))
+  )
 
   ;; CHP run format at CHP_BASE: array of 28-byte records
   ;; [0..3]  cp_start (i32)
@@ -1305,6 +1467,23 @@
           )
         )
 
+        ;; sprmCCv (24-bit RGB color) = 0x6870 — 4-byte operand (COLORREF: 0x00BBGGRR)
+        (if (i32.eq (local.get $opcode) (i32.const 0x6870))
+          (then
+            (local.set $val (call $read_u32_le (local.get $pos)))
+            ;; COLORREF is 0x00BBGGRR, we need 0x00RRGGBB
+            (local.set $color
+              (i32.or
+                (i32.or
+                  (i32.shl (i32.and (local.get $val) (i32.const 0xFF)) (i32.const 16))    ;; R
+                  (i32.and (local.get $val) (i32.const 0xFF00))                             ;; G stays
+                )
+                (i32.shr_u (i32.and (local.get $val) (i32.const 0xFF0000)) (i32.const 16)) ;; B
+              )
+            )
+          )
+        )
+
         ;; sprmCIco (color index) = 0x2A42
         (if (i32.eq (local.get $opcode) (i32.const 0x2A42))
           (then
@@ -1396,7 +1575,7 @@
       (then
         (call $write_chp_run (i32.const 0) (i32.const 0)
           (i32.div_u (global.get $text_len) (i32.const 2))
-          (i32.const 0) (i32.const 24) (i32.const 0x000000))
+          (global.get $style_default_flags) (global.get $style_default_font_size) (i32.const 0x000000))
         (global.set $chp_run_count (i32.const 1))
         (return)
       )
@@ -1494,9 +1673,9 @@
               )
             )
 
-            ;; Default formatting
-            (local.set $flags (i32.const 0))
-            (local.set $font_size (i32.const 24)) ;; 12pt
+            ;; Default formatting from style
+            (local.set $flags (global.get $style_default_flags))
+            (local.set $font_size (global.get $style_default_font_size))
             (local.set $color (i32.const 0x000000))
 
             ;; If offset is 0, no CHPX (use defaults)
@@ -1554,7 +1733,7 @@
       (then
         (call $write_chp_run (i32.const 0) (i32.const 0)
           (i32.div_u (global.get $text_len) (i32.const 2))
-          (i32.const 0) (i32.const 24) (i32.const 0x000000))
+          (global.get $style_default_flags) (global.get $style_default_font_size) (i32.const 0x000000))
         (global.set $chp_run_count (i32.const 1))
       )
     )
