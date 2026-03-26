@@ -43,11 +43,11 @@ Single WAT file (`wat/main.wat`) containing all parsing and layout logic:
 
 Fixed regions at known offsets (see top of `wat/main.wat`):
 - `0x00094000` — CHP runs (28-byte records)
-- `0x00194000` — PAP runs (32-byte records)
-- `0x002A4000` — Style table (20-byte records per istd)
+- `0x00194000` — PAP runs (40-byte records)
+- `0x002A4000` — Style table (28-byte records per istd)
 - `0x002B4000` — Layout segments (28-byte records)
 
-### PAP run format (32 bytes)
+### PAP run format (40 bytes)
 
 | Offset | Field | Description |
 |--------|-------|-------------|
@@ -59,8 +59,25 @@ Fixed regions at known offsets (see top of `wat/main.wat`):
 | 20 | first_indent | First-line indent (twips, signed) |
 | 24 | istd | Style index |
 | 28 | dxaLeft | Left indent (twips, signed) |
+| 32 | ilvl | List indent level |
+| 36 | ilfo | List format override index (>0 = list paragraph) |
+
+### Style table format (28 bytes per entry)
+
+| Offset | Field | Description |
+|--------|-------|-------------|
+| 0 | flags | CHP flags (bold, italic, etc.) |
+| 4 | font_size | Half-points, 0=not set |
+| 8 | color | RGB, 0xFFFFFFFF=not set |
+| 12 | istdBase | Base style index, 0xFFF=no base |
+| 16 | font_index | Font table index, 0xFFFF=not set |
+| 20 | alignment | PAP alignment, 0xFF=not set |
+| 24 | dxaLeft | PAP left indent twips, 0x80000000=not set |
 
 ## Key design decisions
 
 - **Font size bleed fix**: CHP runs can span multiple PAP paragraphs. If a CHP run's font_size matches its start paragraph's style default, the layout engine re-resolves the font_size from the current paragraph's style. This prevents heading sizes from bleeding into body text.
-- **Indent via dxaLeft**: Parsed from `sprmPDxaLeft` (0x840F) and `sprmPDxaLeft80` (0x845E). Applied in layout as pixel offset from the page left margin.
+- **Indent via dxaLeft**: Parsed from `sprmPDxaLeft80` (0x845E). Applied in layout as pixel offset from the page left margin.
+- **Style-level PAP properties**: Paragraph styles' papx UPX is parsed for alignment and dxaLeft, which serve as defaults before direct formatting overrides.
+- **List bullet synthesis**: List paragraphs (ilfo > 0) get a bullet character (U+2022 "•") prepended during layout. Parsed from `sprmPIlvl` (0x260A) and `sprmPIlfo` (0x460B).
+- **sprm_size overrides**: Some sprms (0x845E, 0x8460) have misleading spra bits suggesting variable-length, but are actually fixed 2-byte operands. These are special-cased in `$sprm_size`.

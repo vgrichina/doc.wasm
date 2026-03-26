@@ -64,7 +64,7 @@ function getCHPRun(view, index) {
 
 function getPAPRun(view, index) {
   const PAP_BASE = 0x00194000;
-  const ptr = PAP_BASE + index * 32;
+  const ptr = PAP_BASE + index * 40;
   return {
     cpStart: view.getInt32(ptr, true),
     cpEnd: view.getInt32(ptr + 4, true),
@@ -74,6 +74,8 @@ function getPAPRun(view, index) {
     firstIndent: view.getInt32(ptr + 20, true),
     istd: view.getUint32(ptr + 24, true),
     dxaLeft: view.getInt32(ptr + 28, true),
+    ilvl: view.getUint32(ptr + 32, true),
+    ilfo: view.getUint32(ptr + 36, true),
   };
 }
 
@@ -316,31 +318,32 @@ async function testCellMarks() {
 }
 await testCellMarks();
 
-// ── Lists.doc — paragraph left indent (dxaLeft) ──
+// ── Lists.doc — list paragraphs (ilfo/ilvl) ──
 async function testListsIndent() {
   const { err, text, view, instance } = await loadAndParse('Lists.doc');
-  console.log('\nLists.doc — paragraph left indent');
+  console.log('\nLists.doc — list paragraphs');
   assert('parse succeeds', err === 0);
 
-  // List paragraphs should have non-zero dxaLeft
   const papCount = instance.exports.get_pap_run_count();
-  let hasIndent = false;
-  for (let i = 0; i < papCount; i++) {
-    const run = getPAPRun(view, i);
-    if (run.dxaLeft > 0) {
-      hasIndent = true;
-      break;
-    }
-  }
-  assert('has PAP run with non-zero dxaLeft', hasIndent);
 
-  // Check varying indent levels (multi-level list)
-  const indentValues = new Set();
+  // Check that list paragraphs have non-zero ilfo
+  let hasIlfo = false;
+  let ilfoCount = 0;
   for (let i = 0; i < papCount; i++) {
     const run = getPAPRun(view, i);
-    if (run.dxaLeft > 0) indentValues.add(run.dxaLeft);
+    if (run.ilfo > 0) { hasIlfo = true; ilfoCount++; }
   }
-  assert('has multiple indent levels', indentValues.size >= 2, `found ${indentValues.size} levels: ${[...indentValues].join(', ')}`);
+  assert('has PAP run with non-zero ilfo (list paragraph)', hasIlfo);
+  assert('has multiple list paragraphs', ilfoCount >= 5, `found ${ilfoCount}`);
+
+  // Check varying ilvl (indent levels in multi-level lists)
+  const ilvlValues = new Set();
+  for (let i = 0; i < papCount; i++) {
+    const run = getPAPRun(view, i);
+    if (run.ilfo > 0) ilvlValues.add(run.ilvl);
+  }
+  assert('has multiple indent levels (ilvl)', ilvlValues.size >= 3,
+    `found ${ilvlValues.size} levels: ${[...ilvlValues].join(', ')}`);
 }
 await testListsIndent();
 

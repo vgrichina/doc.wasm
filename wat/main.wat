@@ -78,6 +78,10 @@
   ;; Font table count
   (global $font_count (mut i32) (i32.const 0))
 
+  ;; Bullet character data pointer and length
+  (global $BULLET_PTR i32 (i32.const 0x004B405A))  ;; "• " in UTF-16LE
+  (global $BULLET_LEN i32 (i32.const 4))            ;; 2 UTF-16 code units = 4 bytes
+
   ;; Error codes
   (global $ERR_NONE          i32 (i32.const 0))
   (global $ERR_TOO_SMALL     i32 (i32.const 1))
@@ -107,6 +111,9 @@
   (data (i32.const 0x004B4040) "1\00T\00a\00b\00l\00e\00")
   ;; "Data" (8 bytes)
   (data (i32.const 0x004B4050) "D\00a\00t\00a\00")
+
+  ;; Bullet character U+2022 "•" followed by space U+0020 in UTF-16LE (4 bytes)
+  (data (i32.const 0x004B405A) "\22\20\20\00")
 
   ;; Windows-1252 to Unicode lookup for 0x80-0x9F (32 entries × 4 bytes)
   ;; Stored at 0x004B4060
@@ -1226,16 +1233,18 @@
   (global $style_count             (mut i32) (i32.const 0))
 
   ;; ── STSH (Stylesheet) Parser ──────────────────────────────────
-  ;; Style table at STYLE_BASE: up to 256 styles, 20 bytes each:
+  ;; Style table at STYLE_BASE: up to 256 styles, 28 bytes each:
   ;; [0..3]   flags (i32): bit0=bold, bit1=italic, etc. 0xFFFFFFFF = not set
   ;; [4..7]   font_size (i32, half-points). 0 = not set
   ;; [8..11]  color (i32). 0xFFFFFFFF = not set
   ;; [12..15] istdBase (i32): base style index. 0xFFF = no base
   ;; [16..19] font_index (i32): index into FONT_TABLE. 0xFFFF = not set
+  ;; [20..23] alignment (i32): 0xFF = not set
+  ;; [24..27] dxaLeft (i32, twips): 0x80000000 = not set
 
   ;; Read style entry field
   (func $style_ptr (param $istd i32) (result i32)
-    (i32.add (global.get $STYLE_BASE) (i32.mul (local.get $istd) (i32.const 20)))
+    (i32.add (global.get $STYLE_BASE) (i32.mul (local.get $istd) (i32.const 28)))
   )
 
   ;; Get resolved font_size for a style, walking the base chain (max 10 deep)
@@ -1301,7 +1310,59 @@
     (i32.const 0) ;; fallback: font index 0
   )
 
-  ;; Parse one STD entry's chpx UPX and store results at STYLE_BASE + istd*20
+  ;; Get resolved dxaLeft for a style, walking the base chain
+  (func $style_get_dxaLeft (param $istd i32) (result i32)
+    (local $ptr i32)
+    (local $val i32)
+    (local $base i32)
+    (local $depth i32)
+
+    (block $done
+      (loop $loop
+        (br_if $done (i32.ge_u (local.get $istd) (global.get $style_count)))
+        (br_if $done (i32.ge_u (local.get $depth) (i32.const 10)))
+
+        (local.set $ptr (call $style_ptr (local.get $istd)))
+        (local.set $val (i32.load (i32.add (local.get $ptr) (i32.const 24))))
+        (if (i32.ne (local.get $val) (i32.const 0x80000000)) (then (return (local.get $val))))
+
+        (local.set $base (i32.load (i32.add (local.get $ptr) (i32.const 12))))
+        (br_if $done (i32.eq (local.get $base) (i32.const 0x0FFF)))
+        (local.set $istd (local.get $base))
+        (local.set $depth (i32.add (local.get $depth) (i32.const 1)))
+        (br $loop)
+      )
+    )
+    (i32.const 0)
+  )
+
+  ;; Get resolved alignment for a style, walking the base chain
+  (func $style_get_alignment (param $istd i32) (result i32)
+    (local $ptr i32)
+    (local $val i32)
+    (local $base i32)
+    (local $depth i32)
+
+    (block $done
+      (loop $loop
+        (br_if $done (i32.ge_u (local.get $istd) (global.get $style_count)))
+        (br_if $done (i32.ge_u (local.get $depth) (i32.const 10)))
+
+        (local.set $ptr (call $style_ptr (local.get $istd)))
+        (local.set $val (i32.load (i32.add (local.get $ptr) (i32.const 20))))
+        (if (i32.ne (local.get $val) (i32.const 0xFF)) (then (return (local.get $val))))
+
+        (local.set $base (i32.load (i32.add (local.get $ptr) (i32.const 12))))
+        (br_if $done (i32.eq (local.get $base) (i32.const 0x0FFF)))
+        (local.set $istd (local.get $base))
+        (local.set $depth (i32.add (local.get $depth) (i32.const 1)))
+        (br $loop)
+      )
+    )
+    (i32.const 0)
+  )
+
+  ;; Parse one STD entry's chpx UPX and store results at STYLE_BASE + istd*28
   ;; $upx_ptr points to start of the UPX region, $sgc is style group code
   (func $parse_style_chpx (param $istd i32) (param $upx_ptr i32) (param $end i32) (param $sgc i32)
                            (param $std_base i32)
@@ -1312,15 +1373,64 @@
     (local $color i32)
     (local $font_index i32)
     (local $sptr i32)
+    (local $pap_align i32)
+    (local $pap_dxaLeft i32)
+    (local $pap_grpprl_ptr i32)
+    (local $pap_grpprl_len i32)
 
     (local.set $pos (local.get $upx_ptr))
 
-    ;; For paragraph style (sgc=1): skip papx UPX first, then chpx UPX
+    ;; Initialize style PAP fields to "not set" sentinel values
+    (local.set $sptr (call $style_ptr (local.get $istd)))
+    (i32.store (i32.add (local.get $sptr) (i32.const 20)) (i32.const 0xFF))       ;; alignment not set
+    (i32.store (i32.add (local.get $sptr) (i32.const 24)) (i32.const 0x80000000)) ;; dxaLeft not set
+
+    ;; For paragraph style (sgc=1): parse papx UPX first, then chpx UPX
     (if (i32.eq (local.get $sgc) (i32.const 1))
       (then
         (if (i32.lt_u (i32.add (local.get $pos) (i32.const 2)) (local.get $end))
           (then
             (local.set $cbUpx (call $read_u16_le (local.get $pos)))
+
+            ;; Parse papx UPX grpprl for alignment and dxaLeft
+            ;; papx UPX: cbUpx(2) + istd(2) + grpprl(cbUpx-2)
+            (if (i32.gt_s (local.get $cbUpx) (i32.const 2))
+              (then
+                (local.set $pap_grpprl_ptr (i32.add (local.get $pos) (i32.const 4))) ;; skip cbUpx + istd
+                (local.set $pap_grpprl_len (i32.sub (local.get $cbUpx) (i32.const 2)))
+                (if (i32.le_u (i32.add (local.get $pap_grpprl_ptr) (local.get $pap_grpprl_len)) (local.get $end))
+                  (then
+                    (local.set $pap_align (i32.const 0xFF))
+                    (local.set $pap_dxaLeft (i32.const 0x80000000))
+                    (call $parse_pap_sprms
+                      (local.get $pap_grpprl_ptr) (local.get $pap_grpprl_len)
+                      (local.get $pap_align) (i32.const 0) (i32.const 0) (i32.const 0)
+                      (local.get $pap_dxaLeft)
+                    )
+                    (drop) ;; ilfo
+                    (drop) ;; ilvl
+                    (local.set $pap_dxaLeft)
+                    (drop) ;; first_indent
+                    (drop) ;; space_after
+                    (drop) ;; space_before
+                    (local.set $pap_align)
+
+                    ;; Store in style table
+                    (if (i32.ne (local.get $pap_align) (i32.const 0xFF))
+                      (then
+                        (i32.store (i32.add (local.get $sptr) (i32.const 20)) (local.get $pap_align))
+                      )
+                    )
+                    (if (i32.ne (local.get $pap_dxaLeft) (i32.const 0x80000000))
+                      (then
+                        (i32.store (i32.add (local.get $sptr) (i32.const 24)) (local.get $pap_dxaLeft))
+                      )
+                    )
+                  )
+                )
+              )
+            )
+
             (local.set $pos (i32.add (local.get $pos) (i32.add (i32.const 2) (local.get $cbUpx))))
             (if (i32.and (i32.sub (local.get $pos) (local.get $std_base)) (i32.const 1))
               (then (local.set $pos (i32.add (local.get $pos) (i32.const 1))))
@@ -1640,6 +1750,11 @@
   ;; 0=toggle(1), 1=byte(1), 2=word(2), 3=dword(4), 4=variable, 5=variable, 6=variable, 7=triple(3)
   (func $sprm_size (param $opcode i32) (result i32)
     (local $spra i32)
+    ;; Special-case sprms where spra bits don't match actual operand size
+    ;; sprmPDxaLeft80 (0x845E): spra=4 but actually fixed 2-byte operand
+    ;; sprmPDxaLeft1 (0x8460): spra=4 but actually fixed 2-byte operand
+    (if (i32.eq (local.get $opcode) (i32.const 0x845E)) (then (return (i32.const 2))))
+    (if (i32.eq (local.get $opcode) (i32.const 0x8460)) (then (return (i32.const 2))))
     (local.set $spra (i32.and (i32.shr_u (local.get $opcode) (i32.const 13)) (i32.const 7)))
     (if (i32.eqz (local.get $spra)) (then (return (i32.const 1))))           ;; toggle
     (if (i32.eq (local.get $spra) (i32.const 1)) (then (return (i32.const 1)))) ;; byte
@@ -2164,7 +2279,7 @@
 
   ;; ── PAP (Paragraph Properties) Parser ───────────────────────
 
-  ;; PAP run format at PAP_BASE: array of 32-byte records
+  ;; PAP run format at PAP_BASE: array of 40-byte records
   ;; [0..3]   cp_start (i32)
   ;; [4..7]   cp_end (i32)
   ;; [8..11]  alignment (0=left, 1=center, 2=right, 3=justify)
@@ -2173,13 +2288,16 @@
   ;; [20..23] first_line_indent (twips, can be negative)
   ;; [24..27] istd (style index)
   ;; [28..31] dxaLeft (left indent, twips)
+  ;; [32..35] ilvl (list indent level)
+  ;; [36..39] ilfo (list format override index; >0 = list paragraph)
   (global $pap_run_count (mut i32) (i32.const 0))
 
   (func $write_pap_run (param $idx i32) (param $cp_start i32) (param $cp_end i32)
                         (param $alignment i32) (param $space_before i32) (param $space_after i32)
                         (param $first_indent i32) (param $dxaLeft i32)
+                        (param $ilvl i32) (param $ilfo i32)
     (local $ptr i32)
-    (local.set $ptr (i32.add (global.get $PAP_BASE) (i32.mul (local.get $idx) (i32.const 32))))
+    (local.set $ptr (i32.add (global.get $PAP_BASE) (i32.mul (local.get $idx) (i32.const 40))))
     (i32.store (local.get $ptr) (local.get $cp_start))
     (i32.store (i32.add (local.get $ptr) (i32.const 4)) (local.get $cp_end))
     (i32.store (i32.add (local.get $ptr) (i32.const 8)) (local.get $alignment))
@@ -2187,12 +2305,16 @@
     (i32.store (i32.add (local.get $ptr) (i32.const 16)) (local.get $space_after))
     (i32.store (i32.add (local.get $ptr) (i32.const 20)) (local.get $first_indent))
     (i32.store (i32.add (local.get $ptr) (i32.const 28)) (local.get $dxaLeft))
+    (i32.store (i32.add (local.get $ptr) (i32.const 32)) (local.get $ilvl))
+    (i32.store (i32.add (local.get $ptr) (i32.const 36)) (local.get $ilfo))
   )
 
-  ;; Parse PAP sprms, returns (alignment, space_before, space_after, first_indent, dxaLeft)
+  ;; Parse PAP sprms, returns (alignment, space_before, space_after, first_indent, dxaLeft, ilvl, ilfo)
   (func $parse_pap_sprms (param $ptr i32) (param $len i32)
         (param $align i32) (param $sb i32) (param $sa i32) (param $fi i32) (param $dxaLeft i32)
-        (result i32 i32 i32 i32 i32)
+        (result i32 i32 i32 i32 i32 i32 i32)
+    (local $ilvl i32)
+    (local $ilfo i32)
     (local $pos i32)
     (local $end i32)
     (local $opcode i32)
@@ -2236,14 +2358,19 @@
           (then (local.set $fi (i32.extend16_s (call $read_u16_le (local.get $pos)))))
         )
 
-        ;; sprmPDxaLeft (left indent) = 0x840F (Word 97)
-        (if (i32.eq (local.get $opcode) (i32.const 0x840F))
+        ;; sprmPDxaLeft80 (left indent) = 0x845E (fixed 2-byte)
+        (if (i32.eq (local.get $opcode) (i32.const 0x845E))
           (then (local.set $dxaLeft (i32.extend16_s (call $read_u16_le (local.get $pos)))))
         )
 
-        ;; sprmPDxaLeft80 (left indent) = 0x845E (Word 2000+)
-        (if (i32.eq (local.get $opcode) (i32.const 0x845E))
-          (then (local.set $dxaLeft (i32.extend16_s (call $read_u16_le (local.get $pos)))))
+        ;; sprmPIlvl (list indent level) = 0x260A
+        (if (i32.eq (local.get $opcode) (i32.const 0x260A))
+          (then (local.set $ilvl (call $read_u8 (local.get $pos))))
+        )
+
+        ;; sprmPIlfo (list format override index) = 0x460B
+        (if (i32.eq (local.get $opcode) (i32.const 0x460B))
+          (then (local.set $ilfo (call $read_u16_le (local.get $pos))))
         )
 
         (local.set $pos (i32.add (local.get $pos) (local.get $operand_size)))
@@ -2256,6 +2383,8 @@
     (local.get $sa)
     (local.get $fi)
     (local.get $dxaLeft)
+    (local.get $ilvl)
+    (local.get $ilfo)
   )
 
   (func $parse_pap
@@ -2281,8 +2410,11 @@
     (local $space_after i32)
     (local $first_indent i32)
     (local $dxaLeft i32)
+    (local $ilvl i32)
+    (local $ilfo i32)
     (local $cp_start i32)
     (local $cp_end i32)
+    (local $style_dxaLeft i32)
 
     (local.set $fc_plcfbtepapx (i32.load (i32.add (global.get $FIB_BASE) (i32.const 24))))
     (local.set $lcb (i32.load (i32.add (global.get $FIB_BASE) (i32.const 28))))
@@ -2292,7 +2424,8 @@
       (then
         (call $write_pap_run (i32.const 0) (i32.const 0)
           (i32.div_u (global.get $text_len) (i32.const 2))
-          (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0))
+          (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)
+          (i32.const 0) (i32.const 0))
         (global.set $pap_run_count (i32.const 1))
         (return)
       )
@@ -2369,6 +2502,9 @@
             (local.set $space_after (i32.const 0))
             (local.set $first_indent (i32.const 0))
             (local.set $dxaLeft (i32.const 0))
+            (local.set $ilvl (i32.const 0))
+            (local.set $ilfo (i32.const 0))
+            (local.set $papx_istd (i32.const 0))
 
             (if (local.get $papx_off_byte)
               (then
@@ -2399,6 +2535,18 @@
                   )
                 )
 
+                ;; Inherit defaults from paragraph style
+                (if (i32.and
+                      (i32.gt_u (global.get $style_count) (i32.const 0))
+                      (i32.lt_u (local.get $papx_istd) (global.get $style_count))
+                    )
+                  (then
+                    (local.set $alignment (call $style_get_alignment (local.get $papx_istd)))
+                    (local.set $style_dxaLeft (call $style_get_dxaLeft (local.get $papx_istd)))
+                    (local.set $dxaLeft (local.get $style_dxaLeft))
+                  )
+                )
+
                 (if (i32.gt_s (local.get $grpprl_len) (i32.const 0))
                   (then
                     (call $parse_pap_sprms
@@ -2407,6 +2555,8 @@
                       (local.get $space_after) (local.get $first_indent)
                       (local.get $dxaLeft)
                     )
+                    (local.set $ilfo)
+                    (local.set $ilvl)
                     (local.set $dxaLeft)
                     (local.set $first_indent)
                     (local.set $space_after)
@@ -2427,12 +2577,12 @@
                   (local.get $cp_start) (local.get $cp_end)
                   (local.get $alignment) (local.get $space_before)
                   (local.get $space_after) (local.get $first_indent)
-                  (local.get $dxaLeft)
+                  (local.get $dxaLeft) (local.get $ilvl) (local.get $ilfo)
                 )
                 ;; Store istd at offset 24 of PAP run
                 (i32.store
                   (i32.add
-                    (i32.add (global.get $PAP_BASE) (i32.mul (global.get $pap_run_count) (i32.const 32)))
+                    (i32.add (global.get $PAP_BASE) (i32.mul (global.get $pap_run_count) (i32.const 40)))
                     (i32.const 24)
                   )
                   (local.get $papx_istd)
@@ -2456,7 +2606,8 @@
       (then
         (call $write_pap_run (i32.const 0) (i32.const 0)
           (i32.div_u (global.get $text_len) (i32.const 2))
-          (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0))
+          (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)
+          (i32.const 0) (i32.const 0))
         (global.set $pap_run_count (i32.const 1))
       )
     )
@@ -2943,7 +3094,7 @@
     (block $done
       (loop $loop
         (br_if $done (i32.ge_u (local.get $i) (global.get $pap_run_count)))
-        (local.set $ptr (i32.add (global.get $PAP_BASE) (i32.mul (local.get $i) (i32.const 32))))
+        (local.set $ptr (i32.add (global.get $PAP_BASE) (i32.mul (local.get $i) (i32.const 40))))
         (local.set $start (i32.load (local.get $ptr)))
         (local.set $end (i32.load (i32.add (local.get $ptr) (i32.const 4))))
         (if (i32.and
@@ -2964,7 +3115,7 @@
     (local $pap_idx i32)
     (local $ptr i32)
     (local.set $pap_idx (call $find_pap_at_cp (local.get $cp)))
-    (local.set $ptr (i32.add (global.get $PAP_BASE) (i32.mul (local.get $pap_idx) (i32.const 32))))
+    (local.set $ptr (i32.add (global.get $PAP_BASE) (i32.mul (local.get $pap_idx) (i32.const 40))))
     (i32.load (i32.add (local.get $ptr) (i32.const 24)))
   )
 
@@ -2978,7 +3129,7 @@
     (block $done
       (loop $loop
         (br_if $done (i32.ge_u (local.get $i) (global.get $pap_run_count)))
-        (local.set $ptr (i32.add (global.get $PAP_BASE) (i32.mul (local.get $i) (i32.const 32))))
+        (local.set $ptr (i32.add (global.get $PAP_BASE) (i32.mul (local.get $i) (i32.const 40))))
         (local.set $start (i32.load (local.get $ptr)))
         (local.set $end (i32.load (i32.add (local.get $ptr) (i32.const 4))))
         (if (i32.and
@@ -2996,7 +3147,7 @@
 
   ;; Adjust x positions of segments on a line for alignment
   ;; Shifts segments [start_seg, end_seg) based on alignment and line width
-  (func $align_line (param $start_seg i32) (param $end_seg i32) (param $alignment i32) (param $line_end_x f32)
+  (func $align_line (param $start_seg i32) (param $end_seg i32) (param $alignment i32) (param $line_end_x f32) (param $left_margin f32)
     (local $i i32)
     (local $seg_ptr i32)
     (local $line_width f32)
@@ -3008,14 +3159,14 @@
     (if (i32.ge_u (local.get $start_seg) (local.get $end_seg)) (then (return)))
 
     (local.set $content_right (f32.sub (global.get $PAGE_WIDTH_PX) (global.get $MARGIN_RIGHT_PX)))
-    (local.set $line_width (f32.sub (local.get $line_end_x) (global.get $MARGIN_LEFT_PX)))
+    (local.set $line_width (f32.sub (local.get $line_end_x) (local.get $left_margin)))
 
     ;; Center: shift right by (available - used) / 2
     (if (i32.eq (local.get $alignment) (i32.const 1))
       (then
         (local.set $shift
           (f32.div
-            (f32.sub (f32.sub (local.get $content_right) (global.get $MARGIN_LEFT_PX)) (local.get $line_width))
+            (f32.sub (f32.sub (local.get $content_right) (local.get $left_margin)) (local.get $line_width))
             (f32.const 2.0)
           )
         )
@@ -3025,7 +3176,7 @@
     (if (i32.eq (local.get $alignment) (i32.const 2))
       (then
         (local.set $shift
-          (f32.sub (f32.sub (local.get $content_right) (global.get $MARGIN_LEFT_PX)) (local.get $line_width))
+          (f32.sub (f32.sub (local.get $content_right) (local.get $left_margin)) (local.get $line_width))
         )
       )
     )
@@ -3102,6 +3253,8 @@
     (local $chp_run_start_style_size i32)
     (local $cur_istd i32)
     (local $cur_style_size i32)
+    (local $pap_ilfo i32)
+    (local $bullet_width f32)
 
     (local.set $total_cps (i32.div_u (global.get $text_len) (i32.const 2)))
     (local.set $content_width (f32.sub (global.get $PAGE_WIDTH_PX) (f32.add (global.get $MARGIN_LEFT_PX) (global.get $MARGIN_RIGHT_PX))))
@@ -3120,9 +3273,10 @@
     ;; Initialize alignment and indent for first paragraph
     (local.set $para_align (call $get_pap_alignment (i32.const 0)))
     (local.set $pap_idx (call $find_pap_at_cp (i32.const 0)))
-    (local.set $pap_ptr (i32.add (global.get $PAP_BASE) (i32.mul (local.get $pap_idx) (i32.const 32))))
+    (local.set $pap_ptr (i32.add (global.get $PAP_BASE) (i32.mul (local.get $pap_idx) (i32.const 40))))
     (local.set $pap_dxaLeft (i32.load (i32.add (local.get $pap_ptr) (i32.const 28))))
     (local.set $pap_first_indent (i32.load (i32.add (local.get $pap_ptr) (i32.const 20))))
+    (local.set $pap_ilfo (i32.load (i32.add (local.get $pap_ptr) (i32.const 36))))
     (local.set $para_left_px (f32.add (global.get $MARGIN_LEFT_PX) (call $twips_to_px (local.get $pap_dxaLeft))))
     (local.set $is_first_line (i32.const 1))
     (local.set $cur_x (local.get $para_left_px))
@@ -3130,6 +3284,23 @@
     (if (local.get $pap_first_indent)
       (then
         (local.set $cur_x (f32.add (local.get $cur_x) (call $twips_to_px (local.get $pap_first_indent))))
+      )
+    )
+    ;; Emit bullet for list paragraphs
+    (if (local.get $pap_ilfo)
+      (then
+        (call $setFont (i32.const 24) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0))
+        (local.set $bullet_width (call $measureText (global.get $BULLET_PTR) (global.get $BULLET_LEN)))
+        (call $write_layout_seg
+          (global.get $layout_seg_count)
+          (global.get $BULLET_PTR) (global.get $BULLET_LEN)
+          (local.get $cur_x) (local.get $cur_y)
+          (i32.shl (i32.const 24) (i32.const 16)) ;; font_size=24, no flags
+          (i32.const 0x000000) (i32.const 0)
+        )
+        (global.set $layout_seg_count (i32.add (global.get $layout_seg_count) (i32.const 1)))
+        (local.set $seg_count_on_page (i32.add (local.get $seg_count_on_page) (i32.const 1)))
+        (local.set $cur_x (f32.add (local.get $cur_x) (local.get $bullet_width)))
       )
     )
 
@@ -3184,11 +3355,12 @@
               (global.get $layout_seg_count)
               (local.get $para_align)
               (local.get $cur_x)
+              (local.get $para_left_px)
             )
 
             ;; Get PAP space_after for current paragraph
             (local.set $pap_idx (call $find_pap_at_cp (local.get $cp)))
-            (local.set $pap_ptr (i32.add (global.get $PAP_BASE) (i32.mul (local.get $pap_idx) (i32.const 32))))
+            (local.set $pap_ptr (i32.add (global.get $PAP_BASE) (i32.mul (local.get $pap_idx) (i32.const 40))))
             (local.set $pap_space_after (i32.load (i32.add (local.get $pap_ptr) (i32.const 16))))
 
             ;; New line after paragraph: line_height + space_after (twips→px)
@@ -3206,9 +3378,10 @@
             ;; Update alignment and indent for next paragraph
             (local.set $para_align (call $get_pap_alignment (i32.add (local.get $cp) (i32.const 1))))
             (local.set $pap_idx (call $find_pap_at_cp (i32.add (local.get $cp) (i32.const 1))))
-            (local.set $pap_ptr (i32.add (global.get $PAP_BASE) (i32.mul (local.get $pap_idx) (i32.const 32))))
+            (local.set $pap_ptr (i32.add (global.get $PAP_BASE) (i32.mul (local.get $pap_idx) (i32.const 40))))
             (local.set $pap_dxaLeft (i32.load (i32.add (local.get $pap_ptr) (i32.const 28))))
             (local.set $pap_first_indent (i32.load (i32.add (local.get $pap_ptr) (i32.const 20))))
+            (local.set $pap_ilfo (i32.load (i32.add (local.get $pap_ptr) (i32.const 36))))
             (local.set $para_left_px (f32.add (global.get $MARGIN_LEFT_PX) (call $twips_to_px (local.get $pap_dxaLeft))))
             (local.set $is_first_line (i32.const 1))
             (local.set $cur_x (local.get $para_left_px))
@@ -3216,6 +3389,23 @@
             (if (local.get $pap_first_indent)
               (then
                 (local.set $cur_x (f32.add (local.get $cur_x) (call $twips_to_px (local.get $pap_first_indent))))
+              )
+            )
+            ;; Emit bullet for list paragraphs
+            (if (local.get $pap_ilfo)
+              (then
+                (call $setFont (i32.const 24) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0))
+                (local.set $bullet_width (call $measureText (global.get $BULLET_PTR) (global.get $BULLET_LEN)))
+                (call $write_layout_seg
+                  (global.get $layout_seg_count)
+                  (global.get $BULLET_PTR) (global.get $BULLET_LEN)
+                  (local.get $cur_x) (local.get $cur_y)
+                  (i32.shl (i32.const 24) (i32.const 16))
+                  (i32.const 0x000000) (i32.const 0)
+                )
+                (global.set $layout_seg_count (i32.add (global.get $layout_seg_count) (i32.const 1)))
+                (local.set $seg_count_on_page (i32.add (local.get $seg_count_on_page) (i32.const 1)))
+                (local.set $cur_x (f32.add (local.get $cur_x) (local.get $bullet_width)))
               )
             )
 
@@ -3349,15 +3539,17 @@
               (global.get $layout_seg_count)
               (local.get $para_align)
               (local.get $cur_x)
+              (local.get $para_left_px)
             )
             (local.set $cur_y (f32.add (local.get $cur_y) (f32.add (local.get $line_height) (f32.const 4.0))))
             (local.set $line_height (f32.const 16.0))
             (local.set $line_start_seg (global.get $layout_seg_count))
             (local.set $para_align (call $get_pap_alignment (i32.add (local.get $cp) (i32.const 1))))
             (local.set $pap_idx (call $find_pap_at_cp (i32.add (local.get $cp) (i32.const 1))))
-            (local.set $pap_ptr (i32.add (global.get $PAP_BASE) (i32.mul (local.get $pap_idx) (i32.const 32))))
+            (local.set $pap_ptr (i32.add (global.get $PAP_BASE) (i32.mul (local.get $pap_idx) (i32.const 40))))
             (local.set $pap_dxaLeft (i32.load (i32.add (local.get $pap_ptr) (i32.const 28))))
             (local.set $pap_first_indent (i32.load (i32.add (local.get $pap_ptr) (i32.const 20))))
+            (local.set $pap_ilfo (i32.load (i32.add (local.get $pap_ptr) (i32.const 36))))
             (local.set $para_left_px (f32.add (global.get $MARGIN_LEFT_PX) (call $twips_to_px (local.get $pap_dxaLeft))))
             (local.set $is_first_line (i32.const 1))
             (local.set $cur_x (local.get $para_left_px))
@@ -3382,6 +3574,23 @@
                 (local.set $seg_count_on_page (i32.const 0))
                 (local.set $cur_y (global.get $MARGIN_TOP_PX))
                 (local.set $cur_x (local.get $para_left_px))
+              )
+            )
+            ;; Emit bullet for list paragraphs
+            (if (local.get $pap_ilfo)
+              (then
+                (call $setFont (i32.const 24) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0))
+                (local.set $bullet_width (call $measureText (global.get $BULLET_PTR) (global.get $BULLET_LEN)))
+                (call $write_layout_seg
+                  (global.get $layout_seg_count)
+                  (global.get $BULLET_PTR) (global.get $BULLET_LEN)
+                  (local.get $cur_x) (local.get $cur_y)
+                  (i32.shl (i32.const 24) (i32.const 16))
+                  (i32.const 0x000000) (i32.const 0)
+                )
+                (global.set $layout_seg_count (i32.add (global.get $layout_seg_count) (i32.const 1)))
+                (local.set $seg_count_on_page (i32.add (local.get $seg_count_on_page) (i32.const 1)))
+                (local.set $cur_x (f32.add (local.get $cur_x) (local.get $bullet_width)))
               )
             )
             (local.set $cp (i32.add (local.get $cp) (i32.const 1)))
@@ -3526,6 +3735,7 @@
               (global.get $layout_seg_count)
               (local.get $para_align)
               (local.get $cur_x)
+              (local.get $para_left_px)
             )
 
             ;; Wrap to next line
