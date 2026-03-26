@@ -2720,6 +2720,9 @@
 
     (local.set $cp (i32.const 0))
 
+    ;; Initialize alignment for first paragraph
+    (local.set $para_align (call $get_pap_alignment (i32.const 0)))
+
     (block $all_done
       (loop $cp_loop
         (br_if $all_done (i32.ge_u (local.get $cp) (local.get $total_cps)))
