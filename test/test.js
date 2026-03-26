@@ -20,7 +20,7 @@ async function loadAndParse(filename) {
   const imports = {
     canvas: {
       measureText() { return 0; },
-      setFont() {}, setColor() {}, fillText() {}, fillRect() {}, setPage() {}, drawImage() {},
+      setFont(size, bold, italic, namePtr, nameLen) {}, setColor() {}, fillText() {}, fillRect() {}, setPage() {}, drawImage() {},
     },
     env: { log() {} },
   };
@@ -57,6 +57,7 @@ function getCHPRun(view, index) {
     flags: view.getUint32(ptr + 8, true),
     fontSize: view.getUint32(ptr + 12, true),
     color: view.getUint32(ptr + 16, true),
+    fontIndex: view.getUint32(ptr + 20, true),
   };
 }
 
@@ -108,6 +109,29 @@ async function testTdf116194() {
     assert(`has CHP color ${hex}`, foundColors.has(c),
       `colors found: ${[...foundColors].map(v => '#' + v.toString(16).padStart(6, '0')).join(', ')}`);
   }
+
+  // Validate colors are applied to correct text ranges (not shifted)
+  const textForColor = {};
+  for (let i = 0; i < 200; i++) {
+    const run = getCHPRun(view, i);
+    if (run.cpStart === 0 && run.cpEnd === 0 && i > 0) break;
+    if (run.color !== 0) {
+      const snippet = text.substring(run.cpStart, run.cpEnd).replace(/\r/g, '');
+      const hex = '#' + run.color.toString(16).padStart(6, '0');
+      if (!textForColor[hex]) textForColor[hex] = '';
+      textForColor[hex] += snippet;
+    }
+  }
+  assert('"Dark Red" text has color #c00000', (textForColor['#c00000'] || '').includes('Dark Red'),
+    `#c00000 text: "${textForColor['#c00000']}"`);
+  assert('"Orange" text has color #ffc000', (textForColor['#ffc000'] || '').includes('Orange'),
+    `#ffc000 text: "${textForColor['#ffc000']}"`);
+  assert('"Green" text has color #00b050', (textForColor['#00b050'] || '').includes('Green'),
+    `#00b050 text: "${textForColor['#00b050']}"`);
+  assert('"Blue" text has color #0070c0', (textForColor['#0070c0'] || '').includes('Blue'),
+    `#0070c0 text: "${textForColor['#0070c0']}"`);
+  assert('"Violet" text has color #7030a0', (textForColor['#7030a0'] || '').includes('Violet'),
+    `#7030a0 text: "${textForColor['#7030a0']}"`);
 }
 
 async function testTdf38778() {
@@ -194,7 +218,7 @@ async function test47304() {
 
 async function testTdf118412() {
   console.log('\ntdf118412.doc — long doc with field codes, headings');
-  const { err, text } = await loadAndParse('tdf118412.doc');
+  const { err, text, view } = await loadAndParse('tdf118412.doc');
   assert('parse succeeds', err === 0, `err=${err}`);
   assert('text contains "Xar Format Specification"', text.includes('Xar Format Specification'),
     `missing title`);
@@ -208,6 +232,14 @@ async function testTdf118412() {
   assert('no HYPERLINK field instruction', !text.includes('HYPERLINK'),
     `found raw field code`);
   assert('text length > 1500', text.length > 1500, `len=${text.length}`);
+  // Check that at least one CHP run has a non-zero font index (font name parsed)
+  let hasFont = false;
+  for (let i = 0; i < 200; i++) {
+    const run = getCHPRun(view, i);
+    if (run.cpStart === 0 && run.cpEnd === 0 && i > 0) break;
+    if (run.fontIndex > 0) { hasFont = true; break; }
+  }
+  assert('has CHP run with font_index > 0', hasFont, 'all font indices are 0');
 }
 
 async function testTdf138345() {

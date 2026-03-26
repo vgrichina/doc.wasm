@@ -23,9 +23,13 @@ function decodeText(mem, ptr, len) {
 const imports = {
   canvas: {
     measureText(ptr, len) { if (!ctx) return 0; return ctx.measureText(decodeText(memory, ptr, len)).width; },
-    setFont(size, bold, italic) {
+    setFont(size, bold, italic, namePtr, nameLen) {
       const pt = size / 2;
-      currentFont = `${italic?'italic ':''}${bold?'bold ':''}${pt}pt serif`;
+      let family = 'serif';
+      if (namePtr && nameLen) {
+        family = `"${decodeText(memory, namePtr, nameLen)}", serif`;
+      }
+      currentFont = `${italic?'italic ':''}${bold?'bold ':''}${pt}pt ${family}`;
       if (ctx) ctx.font = currentFont;
     },
     setColor() {}, fillText() {}, fillRect() {}, setPage() {}, drawImage() {},
@@ -60,12 +64,13 @@ for (let i = 0; i < 200; i++) {
   const flags = view.getUint32(ptr + 8, true);
   const fontSize = view.getUint32(ptr + 12, true);
   const color = view.getUint32(ptr + 16, true);
+  const fontIndex = view.getUint32(ptr + 20, true);
   if (cpStart === 0 && cpEnd === 0 && i > 0) break;
   const bold = flags & 1 ? 'B' : '.';
   const italic = flags & 2 ? 'I' : '.';
   const ul = flags & 4 ? 'U' : '.';
   const strike = flags & 8 ? 'S' : '.';
-  console.log(`  [${i}] cp=${cpStart}-${cpEnd} ${bold}${italic}${ul}${strike} size=${fontSize/2}pt color=#${color.toString(16).padStart(6,'0')}`);
+  console.log(`  [${i}] cp=${cpStart}-${cpEnd} ${bold}${italic}${ul}${strike} size=${fontSize/2}pt color=#${color.toString(16).padStart(6,'0')} font=${fontIndex}`);
 }
 
 // PAP runs at 0x00194000, 28 bytes each

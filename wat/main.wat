@@ -7,7 +7,7 @@
   ;; ── Imports (canvas-like API provided by JS) ────────────────
 
   (import "canvas" "measureText" (func $measureText (param $ptr i32) (param $len i32) (result f32)))
-  (import "canvas" "setFont"     (func $setFont (param $size i32) (param $bold i32) (param $italic i32)))
+  (import "canvas" "setFont"     (func $setFont (param $size i32) (param $bold i32) (param $italic i32) (param $namePtr i32) (param $nameLen i32)))
   (import "canvas" "setColor"    (func $setColor (param $rgb i32)))
   (import "canvas" "fillText"    (func $fillText (param $ptr i32) (param $len i32) (param $x f32) (param $y f32)))
   (import "canvas" "fillRect"    (func $fillRect (param $x f32) (param $y f32) (param $w f32) (param $h f32)))
@@ -73,6 +73,10 @@
   (global $SEP_BASE      i32 (i32.const 0x00294000))
   (global $STYLE_BASE    i32 (i32.const 0x002A4000))
   (global $LAYOUT_BASE   i32 (i32.const 0x002B4000))
+  (global $FONT_TABLE    i32 (i32.const 0x002A8000))  ;; 256 entries × 8 bytes = 2KB within STYLE region
+
+  ;; Font table count
+  (global $font_count (mut i32) (i32.const 0))
 
   ;; Error codes
   (global $ERR_NONE          i32 (i32.const 0))
@@ -762,6 +766,13 @@
     (i32.store (i32.add (global.get $FIB_BASE) (i32.const 12))
       (call $read_u32_le (i32.add (local.get $fcLcb_base) (i32.const 0x010C))))
 
+    ;; fcSttbfFfn / lcbSttbfFfn (index 15, offset 0x78)
+    ;; Store at FIB_BASE+48 / FIB_BASE+52
+    (i32.store (i32.add (global.get $FIB_BASE) (i32.const 48))
+      (call $read_u32_le (i32.add (local.get $fcLcb_base) (i32.const 0x0078))))
+    (i32.store (i32.add (global.get $FIB_BASE) (i32.const 52))
+      (call $read_u32_le (i32.add (local.get $fcLcb_base) (i32.const 0x007C))))
+
     (global.get $ERR_NONE)
   )
 
@@ -1184,6 +1195,9 @@
     ;; Phase 8.5: Parse STSH (stylesheet — style defaults)
     (call $parse_stsh)
 
+    ;; Phase 8.6: Parse font table (SttbfFfn)
+    (call $parse_font_table)
+
     ;; Phase 9: Parse PAP (paragraph properties) — before CHP so style istd is available
     (call $parse_pap)
 
@@ -1206,20 +1220,22 @@
   ;; ── CHP (Character Properties) Parser ───────────────────────
 
   ;; Style defaults from STSH (Normal style) — fallback if no style table
-  (global $style_default_font_size (mut i32) (i32.const 24))  ;; default 12pt
+  (global $style_default_font_size  (mut i32) (i32.const 24))  ;; default 12pt
   (global $style_default_flags     (mut i32) (i32.const 0))
+  (global $style_default_font_index (mut i32) (i32.const 0))
   (global $style_count             (mut i32) (i32.const 0))
 
   ;; ── STSH (Stylesheet) Parser ──────────────────────────────────
-  ;; Style table at STYLE_BASE: up to 256 styles, 16 bytes each:
+  ;; Style table at STYLE_BASE: up to 256 styles, 20 bytes each:
   ;; [0..3]   flags (i32): bit0=bold, bit1=italic, etc. 0xFFFFFFFF = not set
   ;; [4..7]   font_size (i32, half-points). 0 = not set
   ;; [8..11]  color (i32). 0xFFFFFFFF = not set
   ;; [12..15] istdBase (i32): base style index. 0xFFF = no base
+  ;; [16..19] font_index (i32): index into FONT_TABLE. 0xFFFF = not set
 
   ;; Read style entry field
   (func $style_ptr (param $istd i32) (result i32)
-    (i32.add (global.get $STYLE_BASE) (i32.mul (local.get $istd) (i32.const 16)))
+    (i32.add (global.get $STYLE_BASE) (i32.mul (local.get $istd) (i32.const 20)))
   )
 
   ;; Get resolved font_size for a style, walking the base chain (max 10 deep)
@@ -1258,7 +1274,34 @@
     )
   )
 
-  ;; Parse one STD entry's chpx UPX and store results at STYLE_BASE + istd*16
+  ;; Get resolved font_index for a style, walking the base chain
+  (func $style_get_font_index (param $istd i32) (result i32)
+    (local $ptr i32)
+    (local $val i32)
+    (local $base i32)
+    (local $depth i32)
+
+    (block $done
+      (loop $loop
+        (br_if $done (i32.ge_u (local.get $istd) (global.get $style_count)))
+        (br_if $done (i32.ge_u (local.get $depth) (i32.const 10)))
+
+        (local.set $ptr (call $style_ptr (local.get $istd)))
+        (local.set $val (i32.load (i32.add (local.get $ptr) (i32.const 16))))
+        (if (i32.ne (local.get $val) (i32.const 0xFFFF)) (then (return (local.get $val))))
+
+        ;; Walk to base style
+        (local.set $base (i32.load (i32.add (local.get $ptr) (i32.const 12))))
+        (br_if $done (i32.eq (local.get $base) (i32.const 0x0FFF)))
+        (local.set $istd (local.get $base))
+        (local.set $depth (i32.add (local.get $depth) (i32.const 1)))
+        (br $loop)
+      )
+    )
+    (i32.const 0) ;; fallback: font index 0
+  )
+
+  ;; Parse one STD entry's chpx UPX and store results at STYLE_BASE + istd*20
   ;; $upx_ptr points to start of the UPX region, $sgc is style group code
   (func $parse_style_chpx (param $istd i32) (param $upx_ptr i32) (param $end i32) (param $sgc i32)
                            (param $std_base i32)
@@ -1267,6 +1310,7 @@
     (local $flags i32)
     (local $font_size i32)
     (local $color i32)
+    (local $font_index i32)
     (local $sptr i32)
 
     (local.set $pos (local.get $upx_ptr))
@@ -1305,8 +1349,10 @@
 
     (call $parse_chp_sprms
       (local.get $pos) (local.get $cbUpx)
-      (local.get $flags) (local.get $font_size) (local.get $color)
+      (local.get $flags) (local.get $font_size) (local.get $color) (i32.const 0xFFFF)
     )
+    ;; Returns (flags, font_size, color, font_index) — pop in reverse order
+    (local.set $font_index)
     (local.set $color)
     (local.set $font_size)
     (local.set $flags)
@@ -1316,6 +1362,111 @@
     (i32.store (local.get $sptr) (local.get $flags))
     (i32.store (i32.add (local.get $sptr) (i32.const 4)) (local.get $font_size))
     (i32.store (i32.add (local.get $sptr) (i32.const 8)) (local.get $color))
+    (i32.store (i32.add (local.get $sptr) (i32.const 16)) (local.get $font_index))
+  )
+
+  ;; ── Font Table (SttbfFfn) Parser ──────────────────────────────
+  ;; Parses font names from the SttbfFfn structure in the table stream.
+  ;; Each entry stored at FONT_TABLE + i*8: name_ptr(4) + name_len(4)
+  (func $parse_font_table
+    (local $fc i32)
+    (local $lcb i32)
+    (local $pos i32)
+    (local $end i32)
+    (local $cData i32)
+    (local $i i32)
+    (local $cbFfn i32)
+    (local $entry_end i32)
+    (local $name_start i32)
+    (local $name_len i32)
+    (local $dst i32)
+    (local $j i32)
+
+    (local.set $fc (i32.load (i32.add (global.get $FIB_BASE) (i32.const 48))))
+    (local.set $lcb (i32.load (i32.add (global.get $FIB_BASE) (i32.const 52))))
+
+    (if (i32.eqz (local.get $lcb)) (then (return)))
+    (if (i32.gt_u (local.get $lcb) (i32.const 0x00100000)) (then (return)))
+    (if (i32.eq (local.get $fc) (i32.const 0xFFFFFFFF)) (then (return)))
+
+    (local.set $pos (i32.add (global.get $table_ptr) (local.get $fc)))
+    (local.set $end (i32.add (local.get $pos) (local.get $lcb)))
+
+    ;; SttbfFfn header: optional 0xFFFF (extended), cData (u16), cbExtra (u16)
+    (if (i32.eq (call $read_u16_le (local.get $pos)) (i32.const 0xFFFF))
+      (then
+        ;; Extended format (UTF-16 strings)
+        (local.set $pos (i32.add (local.get $pos) (i32.const 2)))
+      )
+    )
+    (local.set $cData (call $read_u16_le (local.get $pos)))
+    (local.set $pos (i32.add (local.get $pos) (i32.const 4)))  ;; skip cData + cbExtra
+
+    (if (i32.gt_u (local.get $cData) (i32.const 256))
+      (then (local.set $cData (i32.const 256)))
+    )
+
+    (local.set $i (i32.const 0))
+    (block $done
+      (loop $loop
+        (br_if $done (i32.ge_u (local.get $i) (local.get $cData)))
+        (br_if $done (i32.ge_u (i32.add (local.get $pos) (i32.const 1)) (local.get $end)))
+
+        ;; Each STTB data item: cbFfn (1 byte) + cbFfn bytes of FFN data
+        (local.set $cbFfn (call $read_u8 (local.get $pos)))
+        (local.set $entry_end (i32.add (local.get $pos) (i32.add (i32.const 1) (local.get $cbFfn))))
+        (local.set $pos (i32.add (local.get $pos) (i32.const 1)))
+
+        ;; FFN structure within the cbFfn bytes:
+        ;; Fixed fields: prq/ff(1) + wWeight(2) + chs(1) + ixchSzAlt(1) = 5 bytes min
+        ;; Optional: panose(10) at offset 5, FONTSIGNATURE(24) at offset 15
+        ;; Name offset depends on total size: 39 if cbFfn >= 40, else 15 if >= 16, else 5
+        (if (i32.gt_u (local.get $cbFfn) (i32.const 5))
+          (then
+            (local.set $name_start
+              (i32.add (local.get $pos)
+                (if (result i32) (i32.ge_u (local.get $cbFfn) (i32.const 40))
+                  (then (i32.const 39))
+                  (else (if (result i32) (i32.ge_u (local.get $cbFfn) (i32.const 16))
+                    (then (i32.const 15))
+                    (else (i32.const 5))
+                  ))
+                )
+              )
+            )
+            ;; Find name length: scan for null terminator (0x0000) in UTF-16
+            (local.set $name_len (i32.const 0))
+            (block $name_done
+              (loop $name_loop
+                (br_if $name_done (i32.ge_u (i32.add (local.get $name_start) (i32.add (local.get $name_len) (i32.const 2))) (local.get $entry_end)))
+                (br_if $name_done (i32.eqz (call $read_u16_le (i32.add (local.get $name_start) (local.get $name_len)))))
+                (local.set $name_len (i32.add (local.get $name_len) (i32.const 2)))
+                (br $name_loop)
+              )
+            )
+
+            ;; Copy name to arena
+            (if (i32.gt_u (local.get $name_len) (i32.const 0))
+              (then
+                (local.set $dst (call $arena_alloc (local.get $name_len)))
+                (call $memcpy (local.get $dst) (local.get $name_start) (local.get $name_len))
+                ;; Store ptr+len at FONT_TABLE + i*8
+                (i32.store (i32.add (global.get $FONT_TABLE) (i32.mul (local.get $i) (i32.const 8)))
+                  (local.get $dst))
+                (i32.store (i32.add (i32.add (global.get $FONT_TABLE) (i32.mul (local.get $i) (i32.const 8))) (i32.const 4))
+                  (local.get $name_len))
+              )
+            )
+          )
+        )
+
+        (local.set $pos (local.get $entry_end))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $loop)
+      )
+    )
+
+    (global.set $font_count (local.get $i))
   )
 
   (func $parse_stsh
@@ -1342,8 +1493,10 @@
     (local.set $lcb (i32.load (i32.add (global.get $FIB_BASE) (i32.const 36))))
 
     (if (i32.eqz (local.get $lcb)) (then (return)))
-    ;; Guard against 0xFFFFFFFF
+    ;; Guard against 0xFFFFFFFF or out-of-bounds
     (if (i32.gt_u (local.get $lcb) (i32.const 0x00100000)) (then (return)))
+    (if (i32.eq (local.get $fc) (i32.const 0xFFFFFFFF)) (then (return)))
+    (if (i32.ge_u (local.get $fc) (global.get $table_len)) (then (return)))
 
     (local.set $stsh_ptr (i32.add (global.get $table_ptr) (local.get $fc)))
     (local.set $end (i32.add (local.get $stsh_ptr) (local.get $lcb)))
@@ -1377,6 +1530,7 @@
         (i32.store (i32.add (local.get $sptr) (i32.const 4)) (i32.const 0))  ;; font_size = 0 (not set)
         (i32.store (i32.add (local.get $sptr) (i32.const 8)) (i32.const 0))  ;; color = 0
         (i32.store (i32.add (local.get $sptr) (i32.const 12)) (i32.const 0x0FFF)) ;; no base
+        (i32.store (i32.add (local.get $sptr) (i32.const 16)) (i32.const 0xFFFF)) ;; font_index not set
         (local.set $istd (i32.add (local.get $istd) (i32.const 1)))
         (br $init_loop)
       )
@@ -1467,6 +1621,7 @@
     ;; Set global defaults from style 0 (Normal) via inheritance
     (global.set $style_default_font_size (call $style_get_font_size (i32.const 0)))
     (global.set $style_default_flags (call $style_get_flags (i32.const 0)))
+    (global.set $style_default_font_index (call $style_get_font_index (i32.const 0)))
   )
 
   ;; CHP run format at CHP_BASE: array of 28-byte records
@@ -1475,7 +1630,7 @@
   ;; [8..11] flags: bit0=bold, bit1=italic, bit2=underline, bit3=strike
   ;; [12..15] font_size (half-points, default 24 = 12pt)
   ;; [16..19] color (0x00RRGGBB, default 0)
-  ;; [20..23] reserved
+  ;; [20..23] font_index (index into FONT_TABLE)
   ;; [24..27] reserved
   (global $chp_run_count (mut i32) (i32.const 0))
 
@@ -1496,8 +1651,8 @@
 
   ;; Parse a grpprl (array of sprms) and extract character formatting
   ;; Returns flags in lower 16 bits, font_size in bits 16-31
-  (func $parse_chp_sprms (param $ptr i32) (param $len i32) (param $flags i32) (param $font_size i32) (param $color i32)
-        (result i32 i32 i32)
+  (func $parse_chp_sprms (param $ptr i32) (param $len i32) (param $flags i32) (param $font_size i32) (param $color i32) (param $font_index i32)
+        (result i32 i32 i32 i32)
     (local $pos i32)
     (local $end i32)
     (local $opcode i32)
@@ -1572,6 +1727,18 @@
           )
         )
 
+        ;; Font index sprms (2-byte operand = font table index)
+        ;; sprmCRgFtc0 = 0x4A4F (Word 2000+, ASCII/Latin)
+        ;; sprmCFtcDefault = 0x4A3D (Word 97)
+        (if (i32.or
+              (i32.eq (local.get $opcode) (i32.const 0x4A4F))
+              (i32.eq (local.get $opcode) (i32.const 0x4A3D))
+            )
+          (then
+            (local.set $font_index (call $read_u16_le (local.get $pos)))
+          )
+        )
+
         ;; sprmCCv (24-bit RGB color) = 0x6870 — 4-byte operand (COLORREF: 0x00BBGGRR)
         (if (i32.eq (local.get $opcode) (i32.const 0x6870))
           (then
@@ -1635,11 +1802,12 @@
     (local.get $flags)
     (local.get $font_size)
     (local.get $color)
+    (local.get $font_index)
   )
 
   ;; Write a CHP run record at CHP_BASE + index*28
   (func $write_chp_run (param $idx i32) (param $cp_start i32) (param $cp_end i32)
-                        (param $flags i32) (param $font_size i32) (param $color i32)
+                        (param $flags i32) (param $font_size i32) (param $color i32) (param $font_index i32)
     (local $ptr i32)
     (local.set $ptr (i32.add (global.get $CHP_BASE) (i32.mul (local.get $idx) (i32.const 28))))
     (i32.store (local.get $ptr) (local.get $cp_start))
@@ -1647,6 +1815,7 @@
     (i32.store (i32.add (local.get $ptr) (i32.const 8)) (local.get $flags))
     (i32.store (i32.add (local.get $ptr) (i32.const 12)) (local.get $font_size))
     (i32.store (i32.add (local.get $ptr) (i32.const 16)) (local.get $color))
+    (i32.store (i32.add (local.get $ptr) (i32.const 20)) (local.get $font_index))
   )
 
   (func $parse_chp
@@ -1669,6 +1838,7 @@
     (local $flags i32)
     (local $font_size i32)
     (local $color i32)
+    (local $font_index i32)
     (local $cp_start i32)
     (local $cp_end i32)
     (local $istd i32)
@@ -1681,7 +1851,7 @@
       (then
         (call $write_chp_run (i32.const 0) (i32.const 0)
           (i32.div_u (global.get $text_len) (i32.const 2))
-          (global.get $style_default_flags) (global.get $style_default_font_size) (i32.const 0x000000))
+          (global.get $style_default_flags) (global.get $style_default_font_size) (i32.const 0x000000) (global.get $style_default_font_index))
         (global.set $chp_run_count (i32.const 1))
         (return)
       )
@@ -1750,29 +1920,17 @@
             (local.set $cp_start (call $fc_to_cp (local.get $rgfc_j)))
             (local.set $cp_end (call $fc_to_cp (local.get $rgfc_j1)))
 
-            ;; rgb offset byte at 511 - crun + j (counting from end)
-            ;; Actually: the rgb array starts at offset (crun+1)*4 bytes into the FKP... no
-            ;; The rgb array is at the END of the FKP, before the crun byte:
-            ;; byte at FKP + 511 - crun + j gives the offset
-            ;; Wait — standard layout: rgb[j] is at FKP + (crun+1)*4 + j... no
-            ;; Per MS-DOC: the CHPX offsets are stored as bytes at positions
-            ;; FKP[(crun+1)*4 + j], and each byte * 2 = offset within FKP
-            ;; Actually the layout is simpler in the spec:
-            ;; Position of rgb[j] = fkp_ptr + ((crun+1)*4) + j... no that's wrong too.
-            ;; Let me re-read: ChpxFkp has:
-            ;; rgfc: (crun+1) u32 at start
-            ;; then the CHPX data scattered in the middle
-            ;; rgb: crun bytes at the end (before the last byte which is crun)
-            ;; rgb[j] is at fkp_ptr + 511 - crun + j  (NO)
-            ;; Actually: the bytes at FKP[511-crun..510] are the offsets.
-            ;; So rgb[0] = FKP[511-crun], rgb[1] = FKP[511-crun+1], etc.
+            ;; rgb[j] is at FKP + (crun+1)*4 + j
             ;; Each byte * 2 = byte offset within FKP to find the CHPX
 
             (local.set $chpx_offset
               (i32.mul
                 (call $read_u8
                   (i32.add (local.get $fkp_ptr)
-                    (i32.add (i32.sub (i32.const 511) (local.get $cfkp_crun)) (local.get $j))
+                    (i32.add
+                      (i32.mul (i32.add (local.get $cfkp_crun) (i32.const 1)) (i32.const 4))
+                      (local.get $j)
+                    )
                   )
                 )
                 (i32.const 2)
@@ -1788,10 +1946,12 @@
               (then
                 (local.set $flags (call $style_get_flags (local.get $istd)))
                 (local.set $font_size (call $style_get_font_size (local.get $istd)))
+                (local.set $font_index (call $style_get_font_index (local.get $istd)))
               )
               (else
                 (local.set $flags (global.get $style_default_flags))
                 (local.set $font_size (global.get $style_default_font_size))
+                (local.set $font_index (global.get $style_default_font_index))
               )
             )
             (local.set $color (i32.const 0x000000))
@@ -1811,7 +1971,9 @@
                   (local.get $flags)
                   (local.get $font_size)
                   (local.get $color)
+                  (local.get $font_index)
                 )
+                (local.set $font_index)
                 (local.set $color)
                 (local.set $font_size)
                 (local.set $flags)
@@ -1831,6 +1993,7 @@
                   (local.get $flags)
                   (local.get $font_size)
                   (local.get $color)
+                  (local.get $font_index)
                 )
                 (global.set $chp_run_count (i32.add (global.get $chp_run_count) (i32.const 1)))
               )
@@ -1851,7 +2014,7 @@
       (then
         (call $write_chp_run (i32.const 0) (i32.const 0)
           (i32.div_u (global.get $text_len) (i32.const 2))
-          (global.get $style_default_flags) (global.get $style_default_font_size) (i32.const 0x000000))
+          (global.get $style_default_flags) (global.get $style_default_font_size) (i32.const 0x000000) (global.get $style_default_font_index))
         (global.set $chp_run_count (i32.const 1))
       )
     )
@@ -2833,6 +2996,9 @@
     (local $chp_flags i32)
     (local $chp_size i32)
     (local $chp_color i32)
+    (local $chp_font_index i32)
+    (local $font_name_ptr i32)
+    (local $font_name_len i32)
     (local $word_width f32)
     (local $word_text_ptr i32)
     (local $word_text_len i32)
@@ -3117,11 +3283,29 @@
         (local.set $chp_flags (i32.load (i32.add (local.get $chp_ptr) (i32.const 8))))
         (local.set $chp_size (i32.load (i32.add (local.get $chp_ptr) (i32.const 12))))
         (local.set $chp_color (i32.load (i32.add (local.get $chp_ptr) (i32.const 16))))
+        (local.set $chp_font_index (i32.load (i32.add (local.get $chp_ptr) (i32.const 20))))
+
+        ;; Look up font name from FONT_TABLE
+        (local.set $font_name_ptr (i32.const 0))
+        (local.set $font_name_len (i32.const 0))
+        (if (i32.and
+              (i32.gt_u (global.get $font_count) (i32.const 0))
+              (i32.lt_u (local.get $chp_font_index) (global.get $font_count))
+            )
+          (then
+            (local.set $font_name_ptr
+              (i32.load (i32.add (global.get $FONT_TABLE) (i32.mul (local.get $chp_font_index) (i32.const 8)))))
+            (local.set $font_name_len
+              (i32.load (i32.add (i32.add (global.get $FONT_TABLE) (i32.mul (local.get $chp_font_index) (i32.const 8))) (i32.const 4))))
+          )
+        )
 
         ;; Set font for measurement
         (call $setFont (local.get $chp_size)
           (i32.and (local.get $chp_flags) (i32.const 1))
           (i32.and (i32.shr_u (local.get $chp_flags) (i32.const 1)) (i32.const 1))
+          (local.get $font_name_ptr)
+          (local.get $font_name_len)
         )
 
         ;; Measure word
@@ -3190,9 +3374,15 @@
         )
 
         ;; Write segment
-        ;; Pack font_size into high 16 bits of flags_and_size, format flags in low 16
+        ;; Pack: low 4 bits = format flags, bits 4-11 = font_index, high 16 = font_size
         (local.set $flags_and_size
-          (i32.or (local.get $chp_flags) (i32.shl (local.get $chp_size) (i32.const 16)))
+          (i32.or
+            (i32.or
+              (i32.and (local.get $chp_flags) (i32.const 0xF))
+              (i32.shl (i32.and (local.get $chp_font_index) (i32.const 0xFF)) (i32.const 4))
+            )
+            (i32.shl (local.get $chp_size) (i32.const 16))
+          )
         )
 
         (call $write_layout_seg
@@ -3258,6 +3448,9 @@
     (local $flags i32)
     (local $font_size i32)
     (local $color i32)
+    (local $font_index i32)
+    (local $font_name_ptr i32)
+    (local $font_name_len i32)
 
     ;; Bounds check
     (if (i32.ge_u (local.get $page) (global.get $page_count))
@@ -3293,12 +3486,13 @@
         (local.set $flags_and_size (i32.load (i32.add (local.get $seg_ptr) (i32.const 16))))
         (local.set $color (i32.load (i32.add (local.get $seg_ptr) (i32.const 20))))
 
-        ;; Unpack
-        (local.set $flags (i32.and (local.get $flags_and_size) (i32.const 0xFFFF)))
+        ;; Unpack: low 4 bits = format flags, bits 4-11 = font_index, high 16 = font_size
+        (local.set $flags (i32.and (local.get $flags_and_size) (i32.const 0xF)))
+        (local.set $font_index (i32.and (i32.shr_u (local.get $flags_and_size) (i32.const 4)) (i32.const 0xFF)))
         (local.set $font_size (i32.shr_u (local.get $flags_and_size) (i32.const 16)))
 
-        ;; Check if this is an image segment (flags low 16 = 0xFFFF)
-        (if (i32.eq (local.get $flags) (i32.const 0xFFFF))
+        ;; Check if this is an image segment (flags_and_size low 16 = 0xFFFF)
+        (if (i32.eq (i32.and (local.get $flags_and_size) (i32.const 0xFFFF)) (i32.const 0xFFFF))
           (then
             ;; Image: text_ptr=image data, text_len=image data len
             ;; color = width(low16) | height(high16) packed
@@ -3315,10 +3509,27 @@
           )
         )
 
+        ;; Look up font name
+        (local.set $font_name_ptr (i32.const 0))
+        (local.set $font_name_len (i32.const 0))
+        (if (i32.and
+              (i32.gt_u (global.get $font_count) (i32.const 0))
+              (i32.lt_u (local.get $font_index) (global.get $font_count))
+            )
+          (then
+            (local.set $font_name_ptr
+              (i32.load (i32.add (global.get $FONT_TABLE) (i32.mul (local.get $font_index) (i32.const 8)))))
+            (local.set $font_name_len
+              (i32.load (i32.add (i32.add (global.get $FONT_TABLE) (i32.mul (local.get $font_index) (i32.const 8))) (i32.const 4))))
+          )
+        )
+
         ;; Set font and color
         (call $setFont (local.get $font_size)
           (i32.and (local.get $flags) (i32.const 1))
           (i32.and (i32.shr_u (local.get $flags) (i32.const 1)) (i32.const 1))
+          (local.get $font_name_ptr)
+          (local.get $font_name_len)
         )
         (call $setColor (local.get $color))
 

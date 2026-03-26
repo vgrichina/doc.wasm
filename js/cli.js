@@ -58,10 +58,31 @@ function decodeText(ptr, len) {
   );
 }
 
-function updateFont(size, bold, italic) {
+const fontMap = {
+  'Times New Roman': 'Times New Roman, Times, serif',
+  'Arial': 'Arial, Helvetica, sans-serif',
+  'Calibri': 'Calibri, Arial, sans-serif',
+  'Cambria': 'Cambria, Georgia, serif',
+  'Courier New': 'Courier New, Courier, monospace',
+  'Verdana': 'Verdana, Geneva, sans-serif',
+  'Tahoma': 'Tahoma, Geneva, sans-serif',
+  'Georgia': 'Georgia, Times, serif',
+  'Trebuchet MS': 'Trebuchet MS, sans-serif',
+  'Comic Sans MS': 'Comic Sans MS, cursive',
+  'Impact': 'Impact, sans-serif',
+};
+
+function updateFont(size, bold, italic, namePtr, nameLen) {
   const pt = size / 2;
   const style = (italic ? 'italic ' : '') + (bold ? 'bold ' : '');
-  currentFont = `${style}${pt}pt serif`;
+  let family = 'serif';
+  if (namePtr && nameLen) {
+    const name = new TextDecoder('utf-16le').decode(
+      new Uint8Array(memory.buffer, namePtr, nameLen)
+    );
+    family = fontMap[name] || `"${name}", serif`;
+  }
+  currentFont = `${style}${pt}pt ${family}`;
   if (ctx) ctx.font = currentFont;
 }
 
@@ -72,8 +93,8 @@ const imports = {
       const text = decodeText(ptr, len);
       return ctx.measureText(text).width;
     },
-    setFont(size, bold, italic) {
-      updateFont(size, bold, italic);
+    setFont(size, bold, italic, namePtr, nameLen) {
+      updateFont(size, bold, italic, namePtr, nameLen);
     },
     setColor(rgb) {
       if (ctx) ctx.fillStyle = '#' + (rgb & 0xFFFFFF).toString(16).padStart(6, '0');
