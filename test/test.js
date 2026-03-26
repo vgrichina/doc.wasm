@@ -58,6 +58,7 @@ function getCHPRun(view, index) {
     fontSize: view.getUint32(ptr + 12, true),
     color: view.getUint32(ptr + 16, true),
     fontIndex: view.getUint32(ptr + 20, true),
+    highlight: view.getUint32(ptr + 24, true),
   };
 }
 
@@ -277,6 +278,38 @@ await test47304();
 await testTdf118412();
 await testTdf138345();
 await testTdf59896();
+
+// ── tdf138345.doc — character highlighting ──
+async function testHighlight() {
+  const { err, text, view, instance } = await loadAndParse('tdf138345.doc');
+  console.log('\ntdf138345.doc — character highlighting');
+  assert('parse succeeds', err === 0);
+
+  // Check that at least one CHP run has a non-zero highlight
+  const chpCount = instance.exports.get_chp_run_count();
+  let hasHighlight = false;
+  for (let i = 0; i < chpCount; i++) {
+    const run = getCHPRun(view, i);
+    if (run.highlight !== 0) {
+      hasHighlight = true;
+      break;
+    }
+  }
+  assert('has CHP run with highlight color', hasHighlight);
+}
+await testHighlight();
+
+// ── tdf38778.doc — table cell marks ──
+async function testCellMarks() {
+  const { err, text, view, instance } = await loadAndParse('tdf38778.doc');
+  console.log('\ntdf38778.doc — table cell marks');
+  assert('parse succeeds', err === 0);
+
+  // After cell mark support, layout should produce segments
+  const segCount = instance.exports.get_layout_seg_count();
+  assert('layout produces segments', segCount > 0, `seg_count=${segCount}`);
+}
+await testCellMarks();
 
 console.log(`\n===================`);
 console.log(`Results: ${passed} passed, ${failed} failed`);

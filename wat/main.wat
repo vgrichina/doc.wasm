@@ -1349,9 +1349,10 @@
 
     (call $parse_chp_sprms
       (local.get $pos) (local.get $cbUpx)
-      (local.get $flags) (local.get $font_size) (local.get $color) (i32.const 0xFFFF)
+      (local.get $flags) (local.get $font_size) (local.get $color) (i32.const 0xFFFF) (i32.const 0)
     )
-    ;; Returns (flags, font_size, color, font_index) — pop in reverse order
+    ;; Returns (flags, font_size, color, font_index, highlight) — pop in reverse order
+    (drop) ;; highlight (not stored in style table)
     (local.set $font_index)
     (local.set $color)
     (local.set $font_size)
@@ -1651,8 +1652,8 @@
 
   ;; Parse a grpprl (array of sprms) and extract character formatting
   ;; Returns flags in lower 16 bits, font_size in bits 16-31
-  (func $parse_chp_sprms (param $ptr i32) (param $len i32) (param $flags i32) (param $font_size i32) (param $color i32) (param $font_index i32)
-        (result i32 i32 i32 i32)
+  (func $parse_chp_sprms (param $ptr i32) (param $len i32) (param $flags i32) (param $font_size i32) (param $color i32) (param $font_index i32) (param $highlight i32)
+        (result i32 i32 i32 i32 i32)
     (local $pos i32)
     (local $end i32)
     (local $opcode i32)
@@ -1793,6 +1794,63 @@
           )
         )
 
+        ;; sprmCHighlight (highlight color index) = 0x2A0C
+        (if (i32.eq (local.get $opcode) (i32.const 0x2A0C))
+          (then
+            (local.set $val (call $read_u8 (local.get $pos)))
+            ;; Map ico index to RGB (same table as sprmCIco)
+            (if (i32.le_u (local.get $val) (i32.const 1))
+              (then (local.set $highlight (i32.const 0x000000)))
+            )
+            (if (i32.eq (local.get $val) (i32.const 2))
+              (then (local.set $highlight (i32.const 0x0000FF)))
+            )
+            (if (i32.eq (local.get $val) (i32.const 3))
+              (then (local.set $highlight (i32.const 0x00FFFF)))
+            )
+            (if (i32.eq (local.get $val) (i32.const 4))
+              (then (local.set $highlight (i32.const 0x00FF00)))
+            )
+            (if (i32.eq (local.get $val) (i32.const 5))
+              (then (local.set $highlight (i32.const 0xFF00FF)))
+            )
+            (if (i32.eq (local.get $val) (i32.const 6))
+              (then (local.set $highlight (i32.const 0xFF0000)))
+            )
+            (if (i32.eq (local.get $val) (i32.const 7))
+              (then (local.set $highlight (i32.const 0xFFFF00)))
+            )
+            (if (i32.eq (local.get $val) (i32.const 8))
+              (then (local.set $highlight (i32.const 0xFFFFFF)))
+            )
+            ;; 9-16: dark variants
+            (if (i32.eq (local.get $val) (i32.const 9))
+              (then (local.set $highlight (i32.const 0x000080)))
+            )
+            (if (i32.eq (local.get $val) (i32.const 10))
+              (then (local.set $highlight (i32.const 0x008080)))
+            )
+            (if (i32.eq (local.get $val) (i32.const 11))
+              (then (local.set $highlight (i32.const 0x008000)))
+            )
+            (if (i32.eq (local.get $val) (i32.const 12))
+              (then (local.set $highlight (i32.const 0x800080)))
+            )
+            (if (i32.eq (local.get $val) (i32.const 13))
+              (then (local.set $highlight (i32.const 0x800000)))
+            )
+            (if (i32.eq (local.get $val) (i32.const 14))
+              (then (local.set $highlight (i32.const 0x808000)))
+            )
+            (if (i32.eq (local.get $val) (i32.const 15))
+              (then (local.set $highlight (i32.const 0x808080)))
+            )
+            (if (i32.eq (local.get $val) (i32.const 16))
+              (then (local.set $highlight (i32.const 0xC0C0C0)))
+            )
+          )
+        )
+
         ;; Advance past operand
         (local.set $pos (i32.add (local.get $pos) (local.get $operand_size)))
         (br $loop)
@@ -1803,11 +1861,12 @@
     (local.get $font_size)
     (local.get $color)
     (local.get $font_index)
+    (local.get $highlight)
   )
 
   ;; Write a CHP run record at CHP_BASE + index*28
   (func $write_chp_run (param $idx i32) (param $cp_start i32) (param $cp_end i32)
-                        (param $flags i32) (param $font_size i32) (param $color i32) (param $font_index i32)
+                        (param $flags i32) (param $font_size i32) (param $color i32) (param $font_index i32) (param $highlight i32)
     (local $ptr i32)
     (local.set $ptr (i32.add (global.get $CHP_BASE) (i32.mul (local.get $idx) (i32.const 28))))
     (i32.store (local.get $ptr) (local.get $cp_start))
@@ -1816,6 +1875,7 @@
     (i32.store (i32.add (local.get $ptr) (i32.const 12)) (local.get $font_size))
     (i32.store (i32.add (local.get $ptr) (i32.const 16)) (local.get $color))
     (i32.store (i32.add (local.get $ptr) (i32.const 20)) (local.get $font_index))
+    (i32.store (i32.add (local.get $ptr) (i32.const 24)) (local.get $highlight))
   )
 
   (func $parse_chp
@@ -1839,6 +1899,7 @@
     (local $font_size i32)
     (local $color i32)
     (local $font_index i32)
+    (local $highlight i32)
     (local $cp_start i32)
     (local $cp_end i32)
     (local $istd i32)
@@ -1851,7 +1912,7 @@
       (then
         (call $write_chp_run (i32.const 0) (i32.const 0)
           (i32.div_u (global.get $text_len) (i32.const 2))
-          (global.get $style_default_flags) (global.get $style_default_font_size) (i32.const 0x000000) (global.get $style_default_font_index))
+          (global.get $style_default_flags) (global.get $style_default_font_size) (i32.const 0x000000) (global.get $style_default_font_index) (i32.const 0))
         (global.set $chp_run_count (i32.const 1))
         (return)
       )
@@ -1955,6 +2016,7 @@
               )
             )
             (local.set $color (i32.const 0x000000))
+            (local.set $highlight (i32.const 0))
 
             ;; If offset is 0, no CHPX (use defaults)
             (if (local.get $chpx_offset)
@@ -1972,7 +2034,9 @@
                   (local.get $font_size)
                   (local.get $color)
                   (local.get $font_index)
+                  (local.get $highlight)
                 )
+                (local.set $highlight)
                 (local.set $font_index)
                 (local.set $color)
                 (local.set $font_size)
@@ -1994,6 +2058,7 @@
                   (local.get $font_size)
                   (local.get $color)
                   (local.get $font_index)
+                  (local.get $highlight)
                 )
                 (global.set $chp_run_count (i32.add (global.get $chp_run_count) (i32.const 1)))
               )
@@ -2014,7 +2079,7 @@
       (then
         (call $write_chp_run (i32.const 0) (i32.const 0)
           (i32.div_u (global.get $text_len) (i32.const 2))
-          (global.get $style_default_flags) (global.get $style_default_font_size) (i32.const 0x000000) (global.get $style_default_font_index))
+          (global.get $style_default_flags) (global.get $style_default_font_size) (i32.const 0x000000) (global.get $style_default_font_index) (i32.const 0))
         (global.set $chp_run_count (i32.const 1))
       )
     )
@@ -2791,13 +2856,14 @@
   (global $MARGIN_TOP_PX    (mut f32) (f32.const 96.0))
   (global $MARGIN_BOTTOM_PX (mut f32) (f32.const 96.0))
 
-  ;; Layout segment: 24 bytes
+  ;; Layout segment: 28 bytes
   ;; [0..3]   text_ptr (i32) — pointer into wasm memory
   ;; [4..7]   text_len (i32) — bytes (UTF-16LE)
   ;; [8..11]  x_pos (f32)
   ;; [12..15] y_pos (f32)
   ;; [16..19] flags (i32) — font_size in high 16, fmt flags in low 16
   ;; [20..23] color (i32)
+  ;; [24..27] highlight_color (i32) — 0 = none
 
   (global $layout_seg_count (mut i32) (i32.const 0))
 
@@ -2810,15 +2876,16 @@
   (global $LAYOUT_SEG_DATA   i32 (i32.const 0x002B5F40))  ;; +8000
 
   (func $write_layout_seg (param $idx i32) (param $text_ptr i32) (param $text_len i32)
-                           (param $x f32) (param $y f32) (param $flags_and_size i32) (param $color i32)
+                           (param $x f32) (param $y f32) (param $flags_and_size i32) (param $color i32) (param $highlight i32)
     (local $ptr i32)
-    (local.set $ptr (i32.add (global.get $LAYOUT_SEG_DATA) (i32.mul (local.get $idx) (i32.const 24))))
+    (local.set $ptr (i32.add (global.get $LAYOUT_SEG_DATA) (i32.mul (local.get $idx) (i32.const 28))))
     (i32.store (local.get $ptr) (local.get $text_ptr))
     (i32.store (i32.add (local.get $ptr) (i32.const 4)) (local.get $text_len))
     (f32.store (i32.add (local.get $ptr) (i32.const 8)) (local.get $x))
     (f32.store (i32.add (local.get $ptr) (i32.const 12)) (local.get $y))
     (i32.store (i32.add (local.get $ptr) (i32.const 16)) (local.get $flags_and_size))
     (i32.store (i32.add (local.get $ptr) (i32.const 20)) (local.get $color))
+    (i32.store (i32.add (local.get $ptr) (i32.const 24)) (local.get $highlight))
   )
 
   ;; Find which CHP run covers a given CP
@@ -2953,7 +3020,7 @@
           (loop $loop
             (br_if $done (i32.ge_u (local.get $i) (local.get $end_seg)))
             (local.set $seg_ptr
-              (i32.add (global.get $LAYOUT_SEG_DATA) (i32.mul (local.get $i) (i32.const 24)))
+              (i32.add (global.get $LAYOUT_SEG_DATA) (i32.mul (local.get $i) (i32.const 28)))
             )
             (f32.store (i32.add (local.get $seg_ptr) (i32.const 8))
               (f32.add (f32.load (i32.add (local.get $seg_ptr) (i32.const 8))) (local.get $shift))
@@ -2996,6 +3063,7 @@
     (local $chp_flags i32)
     (local $chp_size i32)
     (local $chp_color i32)
+    (local $chp_highlight i32)
     (local $chp_font_index i32)
     (local $font_name_ptr i32)
     (local $font_name_len i32)
@@ -3180,6 +3248,7 @@
                   (i32.const 16)
                 )
               )
+              (i32.const 0) ;; no highlight for images
             )
             (global.set $layout_seg_count (i32.add (global.get $layout_seg_count) (i32.const 1)))
             (local.set $seg_count_on_page (i32.add (local.get $seg_count_on_page) (i32.const 1)))
@@ -3221,8 +3290,45 @@
           )
         )
 
+        ;; Table cell mark (0x07): treat as paragraph break
+        (if (i32.eq (local.get $char_code) (i32.const 0x07))
+          (then
+            (call $align_line
+              (local.get $line_start_seg)
+              (global.get $layout_seg_count)
+              (local.get $para_align)
+              (local.get $cur_x)
+            )
+            (local.set $cur_y (f32.add (local.get $cur_y) (f32.add (local.get $line_height) (f32.const 4.0))))
+            (local.set $cur_x (global.get $MARGIN_LEFT_PX))
+            (local.set $line_height (f32.const 16.0))
+            (local.set $line_start_seg (global.get $layout_seg_count))
+            (local.set $para_align (call $get_pap_alignment (i32.add (local.get $cp) (i32.const 1))))
+            ;; Page break check
+            (if (f32.ge (local.get $cur_y) (f32.sub (global.get $PAGE_HEIGHT_PX) (global.get $MARGIN_BOTTOM_PX)))
+              (then
+                (i32.store
+                  (i32.add (global.get $LAYOUT_PAGE_TABLE) (i32.mul (local.get $page_num) (i32.const 8)))
+                  (local.get $page_start_seg)
+                )
+                (i32.store
+                  (i32.add (global.get $LAYOUT_PAGE_TABLE) (i32.add (i32.mul (local.get $page_num) (i32.const 8)) (i32.const 4)))
+                  (local.get $seg_count_on_page)
+                )
+                (local.set $page_num (i32.add (local.get $page_num) (i32.const 1)))
+                (local.set $page_start_seg (global.get $layout_seg_count))
+                (local.set $seg_count_on_page (i32.const 0))
+                (local.set $cur_y (global.get $MARGIN_TOP_PX))
+                (local.set $cur_x (global.get $MARGIN_LEFT_PX))
+              )
+            )
+            (local.set $cp (i32.add (local.get $cp) (i32.const 1)))
+            (br $cp_loop)
+          )
+        )
+
         ;; Skip control characters and special Word markers
-        ;; 0x01=embedded obj (no image), 0x07=cell mark, 0x08=drawn obj, 0x0A=LF, etc.
+        ;; 0x01=embedded obj (no image), 0x08=drawn obj, 0x0A=LF, etc.
         (if (i32.lt_u (local.get $char_code) (i32.const 0x20))
           (then
             ;; Tab (0x09): advance x by ~4 spaces worth
@@ -3284,6 +3390,7 @@
         (local.set $chp_size (i32.load (i32.add (local.get $chp_ptr) (i32.const 12))))
         (local.set $chp_color (i32.load (i32.add (local.get $chp_ptr) (i32.const 16))))
         (local.set $chp_font_index (i32.load (i32.add (local.get $chp_ptr) (i32.const 20))))
+        (local.set $chp_highlight (i32.load (i32.add (local.get $chp_ptr) (i32.const 24))))
 
         ;; Look up font name from FONT_TABLE
         (local.set $font_name_ptr (i32.const 0))
@@ -3393,6 +3500,7 @@
           (local.get $cur_y)
           (local.get $flags_and_size)
           (local.get $chp_color)
+          (local.get $chp_highlight)
         )
         (global.set $layout_seg_count (i32.add (global.get $layout_seg_count) (i32.const 1)))
         (local.set $seg_count_on_page (i32.add (local.get $seg_count_on_page) (i32.const 1)))
@@ -3451,6 +3559,7 @@
     (local $font_index i32)
     (local $font_name_ptr i32)
     (local $font_name_len i32)
+    (local $highlight_color i32)
 
     ;; Bounds check
     (if (i32.ge_u (local.get $page) (global.get $page_count))
@@ -3475,7 +3584,7 @@
 
         (local.set $seg_ptr
           (i32.add (global.get $LAYOUT_SEG_DATA)
-            (i32.mul (i32.add (local.get $start_seg) (local.get $i)) (i32.const 24))
+            (i32.mul (i32.add (local.get $start_seg) (local.get $i)) (i32.const 28))
           )
         )
 
@@ -3524,13 +3633,29 @@
           )
         )
 
-        ;; Set font and color
+        ;; Set font (needed before measureText for highlight)
         (call $setFont (local.get $font_size)
           (i32.and (local.get $flags) (i32.const 1))
           (i32.and (i32.shr_u (local.get $flags) (i32.const 1)) (i32.const 1))
           (local.get $font_name_ptr)
           (local.get $font_name_len)
         )
+
+        ;; Draw highlight background if present
+        (local.set $highlight_color (i32.load (i32.add (local.get $seg_ptr) (i32.const 24))))
+        (if (local.get $highlight_color)
+          (then
+            (call $setColor (local.get $highlight_color))
+            (call $fillRect
+              (local.get $x)
+              (local.get $y)
+              (call $measureText (local.get $text_ptr_val) (local.get $text_len_val))
+              (f32.mul (f32.convert_i32_u (local.get $font_size)) (f32.const 0.6667))
+            )
+          )
+        )
+
+        ;; Set text color
         (call $setColor (local.get $color))
 
         ;; Draw text (y needs offset by font ascent — approximate as font_height * 0.8)
@@ -3599,6 +3724,8 @@
   (func $get_text_len (result i32) (global.get $text_len))
   (func $get_page_count (result i32) (global.get $page_count))
   (func $get_error_code (result i32) (global.get $error_code))
+  (func $get_chp_run_count (result i32) (global.get $chp_run_count))
+  (func $get_layout_seg_count (result i32) (global.get $layout_seg_count))
 
   (export "set_input" (func $set_input))
   (export "parse" (func $parse))
@@ -3607,4 +3734,6 @@
   (export "get_text_len" (func $get_text_len))
   (export "get_page_count" (func $get_page_count))
   (export "get_error_code" (func $get_error_code))
+  (export "get_chp_run_count" (func $get_chp_run_count))
+  (export "get_layout_seg_count" (func $get_layout_seg_count))
 )
