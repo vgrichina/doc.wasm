@@ -192,6 +192,45 @@ async function test47304() {
     `text="${clean}"`);
 }
 
+async function testTdf118412() {
+  console.log('\ntdf118412.doc — long doc with field codes, headings');
+  const { err, text } = await loadAndParse('tdf118412.doc');
+  assert('parse succeeds', err === 0, `err=${err}`);
+  assert('text contains "Xar Format Specification"', text.includes('Xar Format Specification'),
+    `missing title`);
+  assert('text contains "ultra-compact, open, vector graphic format"',
+    text.includes('ultra-compact, open, vector graphic format'), `missing abstract phrase`);
+  assert('text contains "Adobe Postscript rendering model"',
+    text.includes('Adobe Postscript rendering model'), `missing background phrase`);
+  // Field codes like INCLUDEPICTURE and HYPERLINK should be filtered
+  assert('no INCLUDEPICTURE field instruction', !text.includes('INCLUDEPICTURE'),
+    `found raw field code`);
+  assert('no HYPERLINK field instruction', !text.includes('HYPERLINK'),
+    `found raw field code`);
+  assert('text length > 1500', text.length > 1500, `len=${text.length}`);
+}
+
+async function testTdf138345() {
+  console.log('\ntdf138345.doc — paragraph style shading');
+  const { err, text } = await loadAndParse('tdf138345.doc');
+  assert('parse succeeds', err === 0, `err=${err}`);
+  assert('text contains "Paragraph styles  can define shading"',
+    text.includes('Paragraph styles  can define shading'), `missing first para`);
+  assert('text contains "overridden or cancelled by a character style"',
+    text.includes('overridden or cancelled by a character style'), `missing second para`);
+  assert('text contains "direct formatting"', text.includes('direct formatting'),
+    `missing third para concept`);
+  assert('text contains "cancel a character style background"',
+    text.includes('cancel a character style background'), `missing last para`);
+}
+
+async function testTdf59896() {
+  console.log('\ntdf59896.doc — Word 6.0/95 format (unsupported)');
+  const { err } = await loadAndParse('tdf59896.doc');
+  // wIdent=0xA5DC (Word 6/95), not 0xA5EC (Word 97+) — should fail gracefully
+  assert('parse returns ERR_BAD_FIB (5)', err === 5, `err=${err}`);
+}
+
 // Run all tests
 console.log('doc.wasm test suite');
 console.log('===================');
@@ -203,6 +242,9 @@ await testPoiTest();
 await testBold();
 await testEmpty();
 await test47304();
+await testTdf118412();
+await testTdf138345();
+await testTdf59896();
 
 console.log(`\n===================`);
 console.log(`Results: ${passed} passed, ${failed} failed`);
