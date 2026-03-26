@@ -64,11 +64,16 @@ function getCHPRun(view, index) {
 
 function getPAPRun(view, index) {
   const PAP_BASE = 0x00194000;
-  const ptr = PAP_BASE + index * 28;
+  const ptr = PAP_BASE + index * 32;
   return {
     cpStart: view.getInt32(ptr, true),
     cpEnd: view.getInt32(ptr + 4, true),
     align: view.getUint32(ptr + 8, true),
+    spaceBefore: view.getUint32(ptr + 12, true),
+    spaceAfter: view.getUint32(ptr + 16, true),
+    firstIndent: view.getInt32(ptr + 20, true),
+    istd: view.getUint32(ptr + 24, true),
+    dxaLeft: view.getInt32(ptr + 28, true),
   };
 }
 
@@ -310,6 +315,87 @@ async function testCellMarks() {
   assert('layout produces segments', segCount > 0, `seg_count=${segCount}`);
 }
 await testCellMarks();
+
+// ── Lists.doc — paragraph left indent (dxaLeft) ──
+async function testListsIndent() {
+  const { err, text, view, instance } = await loadAndParse('Lists.doc');
+  console.log('\nLists.doc — paragraph left indent');
+  assert('parse succeeds', err === 0);
+
+  // List paragraphs should have non-zero dxaLeft
+  const papCount = instance.exports.get_pap_run_count();
+  let hasIndent = false;
+  for (let i = 0; i < papCount; i++) {
+    const run = getPAPRun(view, i);
+    if (run.dxaLeft > 0) {
+      hasIndent = true;
+      break;
+    }
+  }
+  assert('has PAP run with non-zero dxaLeft', hasIndent);
+
+  // Check varying indent levels (multi-level list)
+  const indentValues = new Set();
+  for (let i = 0; i < papCount; i++) {
+    const run = getPAPRun(view, i);
+    if (run.dxaLeft > 0) indentValues.add(run.dxaLeft);
+  }
+  assert('has multiple indent levels', indentValues.size >= 2, `found ${indentValues.size} levels: ${[...indentValues].join(', ')}`);
+}
+await testListsIndent();
+
+// ── tdf118412.doc — font size bleed fix ──
+async function testFontSizeBleed() {
+  // Use a measureText that returns realistic widths so layout actually runs
+  const fileBuffer = readFileSync(join(fixturesDir, 'tdf118412.doc'));
+  const imports = {
+    canvas: {
+      measureText(ptr, len) { return len * 3.5; },
+      setFont() {}, setColor() {}, fillText() {}, fillRect() {}, setPage() {}, drawImage() {},
+    },
+    env: { log() {} },
+  };
+  const { instance } = await WebAssembly.instantiate(wasmBytes, imports);
+  const memory = instance.exports.memory;
+  const inputPtr = 0x004C0000;
+  const needed = Math.ceil((inputPtr + fileBuffer.length * 4) / 65536);
+  const cur = memory.buffer.byteLength / 65536;
+  if (needed > cur) memory.grow(needed - cur);
+  new Uint8Array(memory.buffer).set(
+    new Uint8Array(fileBuffer.buffer, fileBuffer.byteOffset, fileBuffer.length),
+    inputPtr
+  );
+  instance.exports.set_input(inputPtr, fileBuffer.length);
+
+  const err = instance.exports.parse();
+  const view = new DataView(memory.buffer);
+
+  console.log('\ntdf118412.doc — font size bleed fix');
+  assert('parse succeeds', err === 0);
+
+  // Layout segments should have varying font sizes (headings vs body).
+  // The font size bleed bug caused all segments to get the heading size.
+  // flags_and_size: high 16 bits = font_size in half-points
+  const LAYOUT_SEG_DATA = 0x002B4000 + 1024;
+  const segCount = instance.exports.get_layout_seg_count();
+  const sizeHist = {};
+  for (let i = 0; i < segCount; i++) {
+    const ptr = LAYOUT_SEG_DATA + i * 28;
+    const flagsAndSize = view.getUint32(ptr + 16, true);
+    const fontSize = flagsAndSize >>> 16;
+    sizeHist[fontSize] = (sizeHist[fontSize] || 0) + 1;
+  }
+  const sizes = Object.keys(sizeHist).map(Number).sort((a, b) => a - b);
+  assert('has multiple distinct font sizes', sizes.length >= 2,
+    `sizes: ${sizes.map(s => `${s}(${sizeHist[s]})`).join(', ')}`);
+
+  // The most common size should be the body size (smallest), not the heading size
+  const mostCommonSize = sizes.reduce((a, b) => sizeHist[a] > sizeHist[b] ? a : b);
+  const smallestSize = sizes[0];
+  assert('most common font size is the smallest (body text)', mostCommonSize === smallestSize,
+    `most common=${mostCommonSize}(${sizeHist[mostCommonSize]}), smallest=${smallestSize}(${sizeHist[smallestSize]})`);
+}
+await testFontSizeBleed();
 
 console.log(`\n===================`);
 console.log(`Results: ${passed} passed, ${failed} failed`);

@@ -2164,33 +2164,35 @@
 
   ;; ── PAP (Paragraph Properties) Parser ───────────────────────
 
-  ;; PAP run format at PAP_BASE: array of 28-byte records
+  ;; PAP run format at PAP_BASE: array of 32-byte records
   ;; [0..3]   cp_start (i32)
   ;; [4..7]   cp_end (i32)
   ;; [8..11]  alignment (0=left, 1=center, 2=right, 3=justify)
   ;; [12..15] space_before (twips)
   ;; [16..19] space_after (twips)
   ;; [20..23] first_line_indent (twips, can be negative)
-  ;; [24..27] reserved
+  ;; [24..27] istd (style index)
+  ;; [28..31] dxaLeft (left indent, twips)
   (global $pap_run_count (mut i32) (i32.const 0))
 
   (func $write_pap_run (param $idx i32) (param $cp_start i32) (param $cp_end i32)
                         (param $alignment i32) (param $space_before i32) (param $space_after i32)
-                        (param $first_indent i32)
+                        (param $first_indent i32) (param $dxaLeft i32)
     (local $ptr i32)
-    (local.set $ptr (i32.add (global.get $PAP_BASE) (i32.mul (local.get $idx) (i32.const 28))))
+    (local.set $ptr (i32.add (global.get $PAP_BASE) (i32.mul (local.get $idx) (i32.const 32))))
     (i32.store (local.get $ptr) (local.get $cp_start))
     (i32.store (i32.add (local.get $ptr) (i32.const 4)) (local.get $cp_end))
     (i32.store (i32.add (local.get $ptr) (i32.const 8)) (local.get $alignment))
     (i32.store (i32.add (local.get $ptr) (i32.const 12)) (local.get $space_before))
     (i32.store (i32.add (local.get $ptr) (i32.const 16)) (local.get $space_after))
     (i32.store (i32.add (local.get $ptr) (i32.const 20)) (local.get $first_indent))
+    (i32.store (i32.add (local.get $ptr) (i32.const 28)) (local.get $dxaLeft))
   )
 
-  ;; Parse PAP sprms, returns (alignment, space_before, space_after, first_indent)
+  ;; Parse PAP sprms, returns (alignment, space_before, space_after, first_indent, dxaLeft)
   (func $parse_pap_sprms (param $ptr i32) (param $len i32)
-        (param $align i32) (param $sb i32) (param $sa i32) (param $fi i32)
-        (result i32 i32 i32 i32)
+        (param $align i32) (param $sb i32) (param $sa i32) (param $fi i32) (param $dxaLeft i32)
+        (result i32 i32 i32 i32 i32)
     (local $pos i32)
     (local $end i32)
     (local $opcode i32)
@@ -2234,6 +2236,16 @@
           (then (local.set $fi (i32.extend16_s (call $read_u16_le (local.get $pos)))))
         )
 
+        ;; sprmPDxaLeft (left indent) = 0x840F (Word 97)
+        (if (i32.eq (local.get $opcode) (i32.const 0x840F))
+          (then (local.set $dxaLeft (i32.extend16_s (call $read_u16_le (local.get $pos)))))
+        )
+
+        ;; sprmPDxaLeft80 (left indent) = 0x845E (Word 2000+)
+        (if (i32.eq (local.get $opcode) (i32.const 0x845E))
+          (then (local.set $dxaLeft (i32.extend16_s (call $read_u16_le (local.get $pos)))))
+        )
+
         (local.set $pos (i32.add (local.get $pos) (local.get $operand_size)))
         (br $loop)
       )
@@ -2243,6 +2255,7 @@
     (local.get $sb)
     (local.get $sa)
     (local.get $fi)
+    (local.get $dxaLeft)
   )
 
   (func $parse_pap
@@ -2267,6 +2280,7 @@
     (local $space_before i32)
     (local $space_after i32)
     (local $first_indent i32)
+    (local $dxaLeft i32)
     (local $cp_start i32)
     (local $cp_end i32)
 
@@ -2278,7 +2292,7 @@
       (then
         (call $write_pap_run (i32.const 0) (i32.const 0)
           (i32.div_u (global.get $text_len) (i32.const 2))
-          (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0))
+          (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0))
         (global.set $pap_run_count (i32.const 1))
         (return)
       )
@@ -2354,6 +2368,7 @@
             (local.set $space_before (i32.const 0))
             (local.set $space_after (i32.const 0))
             (local.set $first_indent (i32.const 0))
+            (local.set $dxaLeft (i32.const 0))
 
             (if (local.get $papx_off_byte)
               (then
@@ -2390,7 +2405,9 @@
                       (local.get $grpprl_ptr) (local.get $grpprl_len)
                       (local.get $alignment) (local.get $space_before)
                       (local.get $space_after) (local.get $first_indent)
+                      (local.get $dxaLeft)
                     )
+                    (local.set $dxaLeft)
                     (local.set $first_indent)
                     (local.set $space_after)
                     (local.set $space_before)
@@ -2410,11 +2427,12 @@
                   (local.get $cp_start) (local.get $cp_end)
                   (local.get $alignment) (local.get $space_before)
                   (local.get $space_after) (local.get $first_indent)
+                  (local.get $dxaLeft)
                 )
                 ;; Store istd at offset 24 of PAP run
                 (i32.store
                   (i32.add
-                    (i32.add (global.get $PAP_BASE) (i32.mul (global.get $pap_run_count) (i32.const 28)))
+                    (i32.add (global.get $PAP_BASE) (i32.mul (global.get $pap_run_count) (i32.const 32)))
                     (i32.const 24)
                   )
                   (local.get $papx_istd)
@@ -2438,7 +2456,7 @@
       (then
         (call $write_pap_run (i32.const 0) (i32.const 0)
           (i32.div_u (global.get $text_len) (i32.const 2))
-          (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0))
+          (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0))
         (global.set $pap_run_count (i32.const 1))
       )
     )
@@ -2925,7 +2943,7 @@
     (block $done
       (loop $loop
         (br_if $done (i32.ge_u (local.get $i) (global.get $pap_run_count)))
-        (local.set $ptr (i32.add (global.get $PAP_BASE) (i32.mul (local.get $i) (i32.const 28))))
+        (local.set $ptr (i32.add (global.get $PAP_BASE) (i32.mul (local.get $i) (i32.const 32))))
         (local.set $start (i32.load (local.get $ptr)))
         (local.set $end (i32.load (i32.add (local.get $ptr) (i32.const 4))))
         (if (i32.and
@@ -2946,7 +2964,7 @@
     (local $pap_idx i32)
     (local $ptr i32)
     (local.set $pap_idx (call $find_pap_at_cp (local.get $cp)))
-    (local.set $ptr (i32.add (global.get $PAP_BASE) (i32.mul (local.get $pap_idx) (i32.const 28))))
+    (local.set $ptr (i32.add (global.get $PAP_BASE) (i32.mul (local.get $pap_idx) (i32.const 32))))
     (i32.load (i32.add (local.get $ptr) (i32.const 24)))
   )
 
@@ -2960,7 +2978,7 @@
     (block $done
       (loop $loop
         (br_if $done (i32.ge_u (local.get $i) (global.get $pap_run_count)))
-        (local.set $ptr (i32.add (global.get $PAP_BASE) (i32.mul (local.get $i) (i32.const 28))))
+        (local.set $ptr (i32.add (global.get $PAP_BASE) (i32.mul (local.get $i) (i32.const 32))))
         (local.set $start (i32.load (local.get $ptr)))
         (local.set $end (i32.load (i32.add (local.get $ptr) (i32.const 4))))
         (if (i32.and
@@ -3076,6 +3094,14 @@
     (local $pap_idx i32)
     (local $pap_ptr i32)
     (local $pap_space_after i32)
+    (local $pap_dxaLeft i32)
+    (local $pap_first_indent i32)
+    (local $para_left_px f32)
+    (local $is_first_line i32)
+    (local $chp_run_start_istd i32)
+    (local $chp_run_start_style_size i32)
+    (local $cur_istd i32)
+    (local $cur_style_size i32)
 
     (local.set $total_cps (i32.div_u (global.get $text_len) (i32.const 2)))
     (local.set $content_width (f32.sub (global.get $PAGE_WIDTH_PX) (f32.add (global.get $MARGIN_LEFT_PX) (global.get $MARGIN_RIGHT_PX))))
@@ -3091,8 +3117,21 @@
 
     (local.set $cp (i32.const 0))
 
-    ;; Initialize alignment for first paragraph
+    ;; Initialize alignment and indent for first paragraph
     (local.set $para_align (call $get_pap_alignment (i32.const 0)))
+    (local.set $pap_idx (call $find_pap_at_cp (i32.const 0)))
+    (local.set $pap_ptr (i32.add (global.get $PAP_BASE) (i32.mul (local.get $pap_idx) (i32.const 32))))
+    (local.set $pap_dxaLeft (i32.load (i32.add (local.get $pap_ptr) (i32.const 28))))
+    (local.set $pap_first_indent (i32.load (i32.add (local.get $pap_ptr) (i32.const 20))))
+    (local.set $para_left_px (f32.add (global.get $MARGIN_LEFT_PX) (call $twips_to_px (local.get $pap_dxaLeft))))
+    (local.set $is_first_line (i32.const 1))
+    (local.set $cur_x (local.get $para_left_px))
+    ;; Apply first-line indent
+    (if (local.get $pap_first_indent)
+      (then
+        (local.set $cur_x (f32.add (local.get $cur_x) (call $twips_to_px (local.get $pap_first_indent))))
+      )
+    )
 
     (block $all_done
       (loop $cp_loop
@@ -3149,7 +3188,7 @@
 
             ;; Get PAP space_after for current paragraph
             (local.set $pap_idx (call $find_pap_at_cp (local.get $cp)))
-            (local.set $pap_ptr (i32.add (global.get $PAP_BASE) (i32.mul (local.get $pap_idx) (i32.const 28))))
+            (local.set $pap_ptr (i32.add (global.get $PAP_BASE) (i32.mul (local.get $pap_idx) (i32.const 32))))
             (local.set $pap_space_after (i32.load (i32.add (local.get $pap_ptr) (i32.const 16))))
 
             ;; New line after paragraph: line_height + space_after (twips→px)
@@ -3161,12 +3200,24 @@
                 )
               )
             ))
-            (local.set $cur_x (global.get $MARGIN_LEFT_PX))
             (local.set $line_height (f32.const 16.0))
             (local.set $line_start_seg (global.get $layout_seg_count))
 
-            ;; Update alignment for next paragraph
+            ;; Update alignment and indent for next paragraph
             (local.set $para_align (call $get_pap_alignment (i32.add (local.get $cp) (i32.const 1))))
+            (local.set $pap_idx (call $find_pap_at_cp (i32.add (local.get $cp) (i32.const 1))))
+            (local.set $pap_ptr (i32.add (global.get $PAP_BASE) (i32.mul (local.get $pap_idx) (i32.const 32))))
+            (local.set $pap_dxaLeft (i32.load (i32.add (local.get $pap_ptr) (i32.const 28))))
+            (local.set $pap_first_indent (i32.load (i32.add (local.get $pap_ptr) (i32.const 20))))
+            (local.set $para_left_px (f32.add (global.get $MARGIN_LEFT_PX) (call $twips_to_px (local.get $pap_dxaLeft))))
+            (local.set $is_first_line (i32.const 1))
+            (local.set $cur_x (local.get $para_left_px))
+            ;; Apply first-line indent
+            (if (local.get $pap_first_indent)
+              (then
+                (local.set $cur_x (f32.add (local.get $cur_x) (call $twips_to_px (local.get $pap_first_indent))))
+              )
+            )
 
             ;; Page break check
             (if (f32.ge (local.get $cur_y) (f32.sub (global.get $PAGE_HEIGHT_PX) (global.get $MARGIN_BOTTOM_PX)))
@@ -3184,7 +3235,7 @@
                 (local.set $page_start_seg (global.get $layout_seg_count))
                 (local.set $seg_count_on_page (i32.const 0))
                 (local.set $cur_y (global.get $MARGIN_TOP_PX))
-                (local.set $cur_x (global.get $MARGIN_LEFT_PX))
+                (local.set $cur_x (local.get $para_left_px))
               )
             )
 
@@ -3300,10 +3351,21 @@
               (local.get $cur_x)
             )
             (local.set $cur_y (f32.add (local.get $cur_y) (f32.add (local.get $line_height) (f32.const 4.0))))
-            (local.set $cur_x (global.get $MARGIN_LEFT_PX))
             (local.set $line_height (f32.const 16.0))
             (local.set $line_start_seg (global.get $layout_seg_count))
             (local.set $para_align (call $get_pap_alignment (i32.add (local.get $cp) (i32.const 1))))
+            (local.set $pap_idx (call $find_pap_at_cp (i32.add (local.get $cp) (i32.const 1))))
+            (local.set $pap_ptr (i32.add (global.get $PAP_BASE) (i32.mul (local.get $pap_idx) (i32.const 32))))
+            (local.set $pap_dxaLeft (i32.load (i32.add (local.get $pap_ptr) (i32.const 28))))
+            (local.set $pap_first_indent (i32.load (i32.add (local.get $pap_ptr) (i32.const 20))))
+            (local.set $para_left_px (f32.add (global.get $MARGIN_LEFT_PX) (call $twips_to_px (local.get $pap_dxaLeft))))
+            (local.set $is_first_line (i32.const 1))
+            (local.set $cur_x (local.get $para_left_px))
+            (if (local.get $pap_first_indent)
+              (then
+                (local.set $cur_x (f32.add (local.get $cur_x) (call $twips_to_px (local.get $pap_first_indent))))
+              )
+            )
             ;; Page break check
             (if (f32.ge (local.get $cur_y) (f32.sub (global.get $PAGE_HEIGHT_PX) (global.get $MARGIN_BOTTOM_PX)))
               (then
@@ -3319,7 +3381,7 @@
                 (local.set $page_start_seg (global.get $layout_seg_count))
                 (local.set $seg_count_on_page (i32.const 0))
                 (local.set $cur_y (global.get $MARGIN_TOP_PX))
-                (local.set $cur_x (global.get $MARGIN_LEFT_PX))
+                (local.set $cur_x (local.get $para_left_px))
               )
             )
             (local.set $cp (i32.add (local.get $cp) (i32.const 1)))
@@ -3392,6 +3454,23 @@
         (local.set $chp_font_index (i32.load (i32.add (local.get $chp_ptr) (i32.const 20))))
         (local.set $chp_highlight (i32.load (i32.add (local.get $chp_ptr) (i32.const 24))))
 
+        ;; Fix font size bleed: if chp_size matches the style at the CHP run's
+        ;; start CP, it was likely inherited (not explicit). Use the current
+        ;; paragraph's style font_size instead.
+        (local.set $chp_run_start_istd
+          (call $get_istd_at_cp (i32.load (local.get $chp_ptr)))
+        )
+        (local.set $chp_run_start_style_size
+          (call $style_get_font_size (local.get $chp_run_start_istd))
+        )
+        (if (i32.eq (local.get $chp_size) (local.get $chp_run_start_style_size))
+          (then
+            (local.set $cur_istd (call $get_istd_at_cp (local.get $word_start)))
+            (local.set $cur_style_size (call $style_get_font_size (local.get $cur_istd)))
+            (local.set $chp_size (local.get $cur_style_size))
+          )
+        )
+
         ;; Look up font name from FONT_TABLE
         (local.set $font_name_ptr (i32.const 0))
         (local.set $font_name_len (i32.const 0))
@@ -3451,7 +3530,8 @@
 
             ;; Wrap to next line
             (local.set $cur_y (f32.add (local.get $cur_y) (local.get $line_height)))
-            (local.set $cur_x (global.get $MARGIN_LEFT_PX))
+            (local.set $cur_x (local.get $para_left_px))
+            (local.set $is_first_line (i32.const 0))
             (local.set $line_height (f32.const 16.0))
             (local.set $line_start_seg (global.get $layout_seg_count))
 
@@ -3725,6 +3805,7 @@
   (func $get_page_count (result i32) (global.get $page_count))
   (func $get_error_code (result i32) (global.get $error_code))
   (func $get_chp_run_count (result i32) (global.get $chp_run_count))
+  (func $get_pap_run_count (result i32) (global.get $pap_run_count))
   (func $get_layout_seg_count (result i32) (global.get $layout_seg_count))
 
   (export "set_input" (func $set_input))
@@ -3735,5 +3816,6 @@
   (export "get_page_count" (func $get_page_count))
   (export "get_error_code" (func $get_error_code))
   (export "get_chp_run_count" (func $get_chp_run_count))
+  (export "get_pap_run_count" (func $get_pap_run_count))
   (export "get_layout_seg_count" (func $get_layout_seg_count))
 )
